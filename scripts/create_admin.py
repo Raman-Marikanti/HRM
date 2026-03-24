@@ -7,7 +7,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.core.database import SessionLocal
-from app.modules.auth.models import User
+from app.modules.admin.models import User
 from app.modules.employee.models import Employee, Department, Designation
 
 
@@ -16,18 +16,18 @@ def create_admin():
     
     try:
         # Check if admin exists
-        existing = session.query(User).filter(User.username == 'admin').first()
+        existing = session.query(User).filter(User.employee_code == 'admin').first()
         if existing:
             print("✓ Admin user already exists")
             print(f"  Email: {existing.email}")
-            print(f"  Username: {existing.username}")
+            print(f"  Employee Code: {existing.employee_code}")
             print(f"  Phone: {existing.phone_number}")
             return
         
         # Create admin user (phone-based authentication)
         admin = User(
             email='admin@example.com',
-            username='admin',
+            employee_code='admin',
             phone_number='10000000000',
             first_name='Admin',
             last_name='User',

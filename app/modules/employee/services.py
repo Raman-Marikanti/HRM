@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session, joinedload
 from sqlalchemy.exc import IntegrityError
 
 from app.core.database import get_db
-from app.modules.auth.models import User
+from app.modules.admin.models import User
 from app.modules.employee.models import Employee, Department, Designation
 from app.modules.employee.schemas import (
     EmployeeCreate, EmployeeUpdate, 
@@ -170,7 +170,7 @@ def create_employee_service(db: Session, employee_data: EmployeeCreate) -> Emplo
         # Create employee
         new_employee = Employee(
             user_id=user_id,
-            employee_code=_generate_employee_code(user_id),
+            employee_code=user_id.employee_code,
             department_id=dep_id,
             designation_id=desig_id,
         )

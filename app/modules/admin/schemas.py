@@ -1,7 +1,11 @@
+import enum
+
 from pydantic import BaseModel, Field, ConfigDict, validator
 from typing import Optional, List
 from datetime import datetime
 import re
+
+from app.modules.admin.models import UserRole, UserStatus
 
 
 # Base schemas with ORM mode
@@ -15,19 +19,24 @@ class UserBase(BaseSchema):
     first_name: Optional[str] = Field(None, min_length=1, max_length=50)
     last_name: Optional[str] = Field(None, min_length=1, max_length=50)
     email: Optional[str] = Field(None, pattern=r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$')
-    username: Optional[str] = Field(None, min_length=3, max_length=50, pattern=r'^[a-zA-Z0-9_]+$')
 
 
 class UserCreate(UserBase):
     """Create user (all fields optional except phone)"""
+    # employee_code: Optional[str] = Field(None, min_length=3, max_length=50, pattern=r'^[a-zA-Z0-9_]+$')
+    role: Optional[UserRole] = Field(default=UserRole.EMPLOYEE)
+    status: Optional[UserStatus] = Field(default=UserStatus.ACTIVE)
+
     pass
 
 
 class UserUpdate(BaseSchema):
     first_name: Optional[str] = Field(None, min_length=1, max_length=50)
     last_name: Optional[str] = Field(None, min_length=1, max_length=50)
+    role: Optional[UserRole] = Field(default=None)
+    status: Optional[UserStatus] = Field(default=None)
     email: Optional[str] = Field(None, pattern=r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$')
-    username: Optional[str] = Field(None, min_length=3, max_length=50, pattern=r'^[a-zA-Z0-9_]+$')
+    # employee_code: Optional[str] = Field(None, min_length=3, max_length=50, pattern=r'^[a-zA-Z0-9_]+$')
 
 
 class UserOut(BaseSchema):
@@ -37,7 +46,7 @@ class UserOut(BaseSchema):
     last_name: Optional[str]
     full_name: Optional[str]
     email: Optional[str]
-    username: Optional[str]
+    employee_code: Optional[str]
     role: str
     status: str
     is_phone_verified: bool

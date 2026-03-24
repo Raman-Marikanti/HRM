@@ -8,7 +8,8 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.database import get_db
-from app.modules.auth import services
+from app.modules.admin import services
+from sqlalchemy import select
 
 # OAuth2 scheme (using phone number as username)
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/verify-otp", auto_error=False)
@@ -62,7 +63,7 @@ async def get_current_user(
     token: str = Depends(oauth2_scheme),
     db: Session = Depends(get_db)
 ) -> Dict[str, Any]:
-    """Get current user from token"""
+    """Get current user from token with employee link"""
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
@@ -95,12 +96,29 @@ async def get_current_user(
             detail="User account is inactive"
         )
     
-    # Return user info with roles
+    # Get employee_id from employee table if user is an employee
+    employee_id = None
+    try:
+        if hasattr(user, 'employee'):
+            employee_id = user.employee.id if user.employee else None
+        else:
+            # Query employee directly
+            from app.modules.employee.models import Employee
+            employee = db.execute(
+                select(Employee).where(Employee.user_id == user_id)
+            ).scalar_one_or_none()
+            employee_id = employee.id if employee else None
+    except Exception:
+        # If employee lookup fails, continue without employee_id
+        employee_id = None
+    
+    # Return user info with roles and employee link
     return {
         "id": user.id,
         "user_id": user.id,
+        "employee_id": employee_id,
         "phone_number": user.phone_number,
-        "username": user.username,
+        "employee_code": user.employee_code,
         "email": user.email,
         "full_name": user.full_name,
         "role": user.role,

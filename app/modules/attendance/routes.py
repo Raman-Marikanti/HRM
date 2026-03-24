@@ -1,11 +1,12 @@
 from typing import List, Optional
 from datetime import date
 
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi import APIRouter, Depends, HTTPException, status, Query, Request
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.rbac import require_roles, get_current_user
+from app.core.utils import ResponseFormatter, AuditLogger, RequestContextManager
 from app.modules.attendance import services
 from app.modules.attendance.schemas import (
     # Attendance

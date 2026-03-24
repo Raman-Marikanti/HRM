@@ -1,4 +1,6 @@
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, JSON
+import uuid
+
+from sqlalchemy import UUID, Column, Integer, String, Boolean, DateTime, JSON
 from sqlalchemy.sql import func
 from datetime import datetime
 import enum
@@ -11,7 +13,6 @@ class UserRole(str, enum.Enum):
     HR = "hr"
     MANAGER = "manager"
     EMPLOYEE = "employee"
-    USER = "user"
 
 
 class UserStatus(str, enum.Enum):
@@ -23,19 +24,18 @@ class UserStatus(str, enum.Enum):
 class User(Base):
     __tablename__ = "users"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     phone_number = Column(String(20), unique=True, index=True, nullable=False)
     
     # Optional personal info
     first_name = Column(String(128), nullable=True)
     last_name = Column(String(128), nullable=True)
-    email = Column(String(256), nullable=True)  # Optional
-    username = Column(String(128), nullable=True)  # Optional
+    email = Column(String(256), unique=True, nullable=False)  # Optional
+    employee_code = Column(String, unique=True, nullable=False)  # Optional
     
     # Status and roles
-    role = Column(String(50), default=UserRole.USER.value, nullable=False)
+    role = Column(String(50), default=UserRole.EMPLOYEE.value, nullable=False)
     status = Column(String(50), default=UserStatus.ACTIVE.value, nullable=False)
-    roles = Column(JSON, default=list, nullable=False)
     
     # Phone verification
     is_phone_verified = Column(Boolean, default=False, nullable=False)
@@ -77,10 +77,9 @@ class User(Base):
             "last_name": self.last_name,
             "full_name": self.full_name,
             "email": self.email,
-            "username": self.username,
+            "employee_code": self.employee_code,
             "role": self.role,
             "status": self.status,
-            "roles": self.roles,
             "is_phone_verified": self.is_phone_verified,
             "created_at": self.created_at,
             "updated_at": self.updated_at,

@@ -33,7 +33,7 @@ except Exception as e:
 try:
     with psycopg.connect(conn_str) as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT id, username, roles FROM users ORDER BY id DESC LIMIT 100;")
+            cur.execute("SELECT id, employee_code, roles FROM users ORDER BY id DESC LIMIT 100;")
             rows = cur.fetchall()
             if not rows:
                 print("No rows found in users table.")

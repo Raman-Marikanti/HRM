@@ -1,6 +1,6 @@
 from fastapi import Depends, HTTPException, status
 
-from app.modules.auth.security import get_current_user
+from app.modules.admin.security import get_current_user
 
 
 def require_roles(*roles: str):

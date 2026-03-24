@@ -3,7 +3,7 @@ from sqlalchemy.orm import relationship, validates, backref
 from datetime import datetime
 
 from app.core.database import Base
-from app.modules.auth.models import User
+from app.modules.admin.models import User
 
 
 class Department(Base):

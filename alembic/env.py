@@ -8,7 +8,7 @@ sys.path.insert(0, os.path.abspath(os.getcwd()))
 
 from app.core.database import Base            # your declarative base
 # import modules so their models are registered with Base.metadata
-from app.modules.auth import models as auth_models  # noqa: F401
+from app.modules.admin import models as auth_models  # noqa: F401
 from app.modules.employee import models as emp_models  # noqa: F401
 
 config = context.config
