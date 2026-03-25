@@ -3,6 +3,8 @@ from datetime import datetime
 from typing import Optional, List
 from pydantic import BaseModel, Field, validator
 
+from app.modules.admin.schemas import UserOut
+
 # Department Schemas
 class DepartmentBase(BaseModel):
     name: str = Field(..., max_length=128)
@@ -188,6 +190,7 @@ class EmployeeResponse(EmployeeBase):
     full_name: Optional[str] = None
     
     # Related data
+    user: Optional[UserOut] = None
     department: Optional[DepartmentResponse] = None
     designation: Optional[DesignationResponse] = None
     manager: Optional['EmployeeResponse'] = None

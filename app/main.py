@@ -8,7 +8,7 @@ import logging
 
 from app.modules.admin import router as auth_router
 from app.modules.admin.models import User
-from app.modules.employee import emp_router
+from app.modules.employee import emp_router, emp_auth_router
 from app.modules.attendance import attendance_router
 from app.core.database import engine
 from app.core.database import SessionLocal
@@ -82,6 +82,7 @@ def root():
 
 
 app.include_router(auth_router)
+app.include_router(emp_auth_router)
 app.include_router(emp_router)
 # app.include_router(attendance_router)
 
@@ -90,11 +91,12 @@ app.include_router(emp_router)
 @app.on_event("startup")
 async def on_startup():
     try:
-        from scripts.create_admin import create_admin
+        from scripts.create_admin import create_admin, create_defualt_departments_and_designations
         session = SessionLocal()
         admin = session.query(select(User)).filter(User.employee_code == 'admin').first()
         if not admin:
             create_admin()
+            create_defualt_departments_and_designations()
         else:
             logger.info("Admin user already exists, skipping creation.")
         session.close()
