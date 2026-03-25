@@ -4,1094 +4,888 @@ from fastapi import APIRouter, Depends, HTTPException, status, Query, Request
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.rbac import require_roles, get_current_user
-from app.core.errors import (
-    ResourceNotFoundError, ValidationError, DuplicateError, 
-    ErrorCodes, HRMSException
-)
-from app.core.utils import (
-    ResponseFormatter, AuditLogger, RequestContextManager
-)
-from app.modules.employee import services
-from app.modules.employee.schemas import (
-    EmployeeCreate, EmployeeOut, EmployeeDetailOut, 
-    EmployeeUpdate, DepartmentCreate, DepartmentOut,
-    DepartmentUpdate, DesignationCreate, DesignationOut,
-    DesignationUpdate
-)
 
-router = APIRouter(prefix="/emp", tags=["Employee Management"])
+from app.modules.admin.schemas import LoginResponse, OTPRequest, OTPResponse, OTPVerify
+from app.modules.admin.security import ACCESS_TOKEN_EXPIRE_MINUTES, create_access_token
+
+from app.modules.admin import services as admin_services
+
+router = APIRouter(prefix="/employee/auth", tags=["Employee Management"])
+
+
+# ============================================================================
+# OTP Authentication Endpoints
+# ============================================================================
+
+@router.post("/send-otp", response_model=OTPResponse)
+def send_otp(
+    otp_request: OTPRequest,
+    db: Session = Depends(get_db)
+):
+    """Send OTP to phone number for login/registration"""
+    # verify user exists or create a new one (without committing yet)
+    User = admin_services.get_user_by_phone(db, otp_request.phone_number)
+    if not User:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found. Please register first.")
+    if User.employee_code == 'admin':
+        return OTPResponse(
+            ok=True,
+            message="OTP sent successfully (admin user)",
+            expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60
+        )
+    result = admin_services.send_otp(
+        otp_request.phone_number, 
+        otp_request.purpose
+    )
+    return OTPResponse(  
+        ok=True,
+        message=result["message"],
+        expires_in=result["expires_in"]
+    )
+
+
+@router.post("/verify-otp", response_model=LoginResponse)
+def verify_otp_and_login(
+    otp_verify: OTPVerify,
+    request: Request,
+    db: Session = Depends(get_db)
+):
+    """Verify OTP and login/register user"""
+    try:
+        # Authenticate with OTP
+        auth_result = admin_services.authenticate_with_otp(
+            db, 
+            otp_verify.phone_number, 
+            otp_verify.otp,
+            request.client.host
+        )
+        
+        user = auth_result["user"]
+        is_new_user = auth_result["is_new_user"]
+        
+        # Create access token
+        access_token = create_access_token(
+            subject=user.phone_number,
+            extra_data={
+                "user_id": user.id,
+                "roles":  [user.role]
+            }
+        )
+        
+        return LoginResponse(
+            access_token=access_token,
+            token_type="bearer",
+            expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+            user=user,
+            is_new_user=is_new_user
+        )
+        
+    except services.InvalidOTPError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except services.AccountLockedError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+
+
+@router.post("/logout")
+def logout():
+    """Logout user (client should discard token)"""
+    return {"message": "Successfully logged out"}
+
 
 
 # ============================================================================
 # EMPLOYEE ENDPOINTS
 # ============================================================================
 
-@router.post("/employees", status_code=status.HTTP_201_CREATED)
-def create_employee(
-    payload: EmployeeCreate,
-    request: Request,
-    current_user: dict = Depends(require_roles("admin", "hr_manager")),
-    db: Session = Depends(get_db)
-):
-    """Create a new employee - Standard SOP for employee onboarding"""
-    request_id = RequestContextManager.get_request_id()
-    client_ip, user_agent = RequestContextManager.get_client_info(request)
-    
-    try:
-        # Validate input
-        if not payload.employee_code:
-            raise ValidationError("Employee code is required", field="employee_code")
-        
-        # Create employee
-        employee = services.create_employee_service(db, payload)
-        db.commit()
-        
-        # Audit log
-        AuditLogger.log_action(
-            db=db,
-            user_id=current_user["user_id"],
-            user_phone=current_user["phone_number"],
-            module="employee",
-            action="create",
-            resource_type="Employee",
-            resource_id=employee.id,
-            ip_address=client_ip,
-            user_agent=user_agent,
-            new_values={
-                "employee_code": employee.employee_code,
-                "department_id": employee.department_id
-            },
-            status_str="success"
-        )
-        
-        return ResponseFormatter.created(
-            data=employee,
-            message="Employee created successfully",
-            request_id=request_id
-        )
-    except HRMSException:
-        db.rollback()
-        raise
-    except services.DuplicateError as e:
-        db.rollback()
-        raise DuplicateError("Employee", field="employee_code")
-    except Exception as e:
-        db.rollback()
-        raise HRMSException(
-            error_code=ErrorCodes.INTERNAL_SERVER_ERROR,
-            message="Failed to create employee",
-            http_status=status.HTTP_500_INTERNAL_SERVER_ERROR
-        )
+# app/modules/employee/routes.py
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy.orm import Session
+from sqlalchemy import and_, or_
+from typing import Optional, List
+from datetime import datetime
+from app.core.database import get_db
+from app.modules.employee import models, schemas, services
+from app.modules.admin.models import User
 
+router = APIRouter(prefix="/employee", tags=["Employee Management"])
 
-@router.get("/employees/{employee_id}")
-def get_employee(
-    employee_id: int,
-    request: Request,
-    current_user: dict = Depends(require_roles()),
-    db: Session = Depends(get_db)
-):
-    """Get employee details by ID"""
-    request_id = RequestContextManager.get_request_id()
-    
-    try:
-        employee = services.get_employee_by_id(db, employee_id)
-        if not employee:
-            raise ResourceNotFoundError("Employee", employee_id)
-        
-        return ResponseFormatter.success(
-            data=employee,
-            message="Employee details retrieved",
-            request_id=request_id
-        )
-    except HRMSException:
-        raise
-    except Exception as e:
-        raise HRMSException(
-            error_code=ErrorCodes.INTERNAL_SERVER_ERROR,
-            message="Failed to fetch employee",
-            http_status=status.HTTP_500_INTERNAL_SERVER_ERROR
-        )
-
-
-@router.get("/employees")
-def get_all_employees(
-    request: Request,
-    offset: int = Query(0, ge=0, description="Number of records to skip"),
-    limit: int = Query(50, ge=1, le=500, description="Number of records to return"),
-    department_id: Optional[int] = Query(None, description="Filter by department"),
-    is_active: Optional[bool] = Query(None, description="Filter by active status"),
-    current_user: dict = Depends(require_roles()),
-    db: Session = Depends(get_db)
-):
-    """List all employees with pagination and filters - Standard SOP"""
-    request_id = RequestContextManager.get_request_id()
-    
-    try:
-        result = services.get_all_employees(
-            db=db,
-            skip=offset,
-            limit=limit,
-            department_id=department_id,
-            is_active=is_active
-        )
-        
-        total = result.get("total", 0)
-        employees = result.get("data", [])
-        
-        return ResponseFormatter.paginated(
-            items=employees,
-            total=total,
-            skip=offset,
-            limit=limit,
-            message="Employees retrieved successfully",
-            request_id=request_id
-        )
-    except HRMSException:
-        raise
-    except Exception as e:
-        raise HRMSException(
-            error_code=ErrorCodes.INTERNAL_SERVER_ERROR,
-            message="Failed to fetch employees",
-            http_status=status.HTTP_500_INTERNAL_SERVER_ERROR
-        )
-
-
-@router.put("/employees/{employee_id}")
-def update_employee(
-    employee_id: int,
-    payload: EmployeeUpdate,
-    request: Request,
-    current_user: dict = Depends(require_roles("admin", "hr_manager")),
-    db: Session = Depends(get_db)
-):
-    """Update employee information - Standard SOP"""
-    request_id = RequestContextManager.get_request_id()
-    client_ip, user_agent = RequestContextManager.get_client_info(request)
-    
-    try:
-        # Get existing employee
-        existing_employee = services.get_employee_by_id(db, employee_id)
-        if not existing_employee:
-            raise ResourceNotFoundError("Employee", employee_id)
-        
-        old_values = {
-            "department_id": existing_employee.department_id,
-            "is_active": existing_employee.is_active
-        }
-        
-        # Update employee
-        employee = services.update_employee(db, employee_id, payload)
-        db.commit()
-        
-        # Audit log
-        AuditLogger.log_action(
-            db=db,
-            user_id=current_user["user_id"],
-            user_phone=current_user["phone_number"],
-            module="employee",
-            action="update",
-            resource_type="Employee",
-            resource_id=employee.id,
-            ip_address=client_ip,
-            user_agent=user_agent,
-            old_values=old_values,
-            new_values={
-                "department_id": employee.department_id,
-                "is_active": employee.is_active
-            },
-            status_str="success"
-        )
-        
-        return ResponseFormatter.success(
-            data=employee,
-            message="Employee updated successfully",
-            request_id=request_id
-        )
-    except HRMSException:
-        db.rollback()
-        raise
-    except services.DuplicateError as e:
-        db.rollback()
-        raise DuplicateError("Employee")
-    except Exception as e:
-        db.rollback()
-        raise HRMSException(
-            error_code=ErrorCodes.INTERNAL_SERVER_ERROR,
-            message="Failed to update employee",
-            http_status=status.HTTP_500_INTERNAL_SERVER_ERROR
-        )
-
-
-@router.delete("/employees/{employee_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_employee(
-    employee_id: int,
-    request: Request,
-    current_user: dict = Depends(require_roles("admin")),
-    db: Session = Depends(get_db)
-):
-    """Soft delete employee - Standard SOP"""
-    client_ip, user_agent = RequestContextManager.get_client_info(request)
-    
-    try:
-        # Verify employee exists
-        existing_employee = services.get_employee_by_id(db, employee_id)
-        if not existing_employee:
-            raise ResourceNotFoundError("Employee", employee_id)
-        
-        # Delete employee (soft delete)
-        services.delete_employee(db, employee_id)
-        db.commit()
-        
-        # Audit log
-        AuditLogger.log_action(
-            db=db,
-            user_id=current_user["user_id"],
-            user_phone=current_user["phone_number"],
-            module="employee",
-            action="delete",
-            resource_type="Employee",
-            resource_id=employee_id,
-            ip_address=client_ip,
-            user_agent=user_agent,
-            status_str="success"
-        )
-        
-        return None
-    except HRMSException:
-        db.rollback()
-        raise
-    except Exception as e:
-        db.rollback()
-        raise HRMSException(
-            error_code=ErrorCodes.INTERNAL_SERVER_ERROR,
-            message="Failed to delete employee",
-            http_status=status.HTTP_500_INTERNAL_SERVER_ERROR
-        )
-
-
-# ============================================================================
-# DEPARTMENT ENDPOINTS
-# ============================================================================
-
-@router.post("/departments", status_code=status.HTTP_201_CREATED)
+# ==================== Department Routes ====================
+@router.post("/departments", response_model=schemas.DepartmentResponse, status_code=status.HTTP_201_CREATED)
 def create_department(
-    payload: DepartmentCreate,
-    request: Request,
-    current_user: dict = Depends(require_roles("admin", "hr_manager")),
-    db: Session = Depends(get_db)
+    department_in: schemas.DepartmentCreate,
+    db: Session = Depends(get_db),
 ):
     """Create a new department"""
-    request_id = RequestContextManager.get_request_id()
-    client_ip, user_agent = RequestContextManager.get_client_info(request)
+    # Check if department exists
+    existing = db.query(models.Department).filter(
+        models.Department.name == department_in.name
+    ).first()
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Department with this name already exists"
+        )
     
-    try:
-        if not payload.name or len(payload.name.strip()) == 0:
-            raise ValidationError("Department name is required", field="name")
-        
-        department = services.create_department_service(db, payload)
-        db.commit()
-        
-        # Audit log
-        AuditLogger.log_action(
-            db=db,
-            user_id=current_user["user_id"],
-            user_phone=current_user["phone_number"],
-            module="employee",
-            action="create",
-            resource_type="Department",
-            resource_id=department.id,
-            ip_address=client_ip,
-            user_agent=user_agent,
-            new_values={"name": department.name},
-            status_str="success"
-        )
-        
-        return ResponseFormatter.created(
-            data=department,
-            message="Department created successfully",
-            request_id=request_id
-        )
-    except HRMSException:
-        db.rollback()
-        raise
-    except services.DuplicateError as e:
-        db.rollback()
-        raise DuplicateError("Department", field="name")
-    except Exception as e:
-        db.rollback()
-        raise HRMSException(
-            error_code=ErrorCodes.INTERNAL_SERVER_ERROR,
-            message="Failed to create department",
-            http_status=status.HTTP_500_INTERNAL_SERVER_ERROR
-        )
+    # Create department
+    db_department = models.Department(**department_in.model_dump())
+    db.add(db_department)
+    db.commit()
+    db.refresh(db_department)
+    
+    return db_department
 
-
-@router.get("/departments")
-def list_departments(
-    request: Request,
+@router.get("/departments", response_model=List[schemas.DepartmentResponse])
+def read_departments(
     skip: int = Query(0, ge=0),
-    limit: int = Query(50, ge=1, le=500),
-    current_user: dict = Depends(require_roles()),
-    db: Session = Depends(get_db)
+    limit: int = Query(100, ge=1, le=100),
+    db: Session = Depends(get_db),
 ):
-    """List all departments with pagination"""
-    request_id = RequestContextManager.get_request_id()
-    
-    try:
-        result = services.list_departments(db, skip=skip, limit=limit)
-        total = result.get("total", 0)
-        departments = result.get("data", [])
-        
-        return ResponseFormatter.paginated(
-            items=departments,
-            total=total,
-            skip=skip,
-            limit=limit,
-            message="Departments retrieved successfully",
-            request_id=request_id
-        )
-    except HRMSException:
-        raise
-    except Exception as e:
-        raise HRMSException(
-            error_code=ErrorCodes.INTERNAL_SERVER_ERROR,
-            message="Failed to fetch departments",
-            http_status=status.HTTP_500_INTERNAL_SERVER_ERROR
-        )
+    """Get all departments"""
+    departments = db.query(models.Department).offset(skip).limit(limit).all()
+    return departments
 
-
-@router.get("/departments/{department_id}")
-def get_department(
+@router.get("/departments/{department_id}", response_model=schemas.DepartmentResponse)
+def read_department(
     department_id: int,
-    request: Request,
-    current_user: dict = Depends(require_roles()),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
     """Get department by ID"""
-    request_id = RequestContextManager.get_request_id()
+    department = db.query(models.Department).filter(
+        models.Department.id == department_id
+    ).first()
     
-    try:
-        department = services.get_department_by_id(db, department_id)
-        if not department:
-            raise ResourceNotFoundError("Department", department_id)
-        
-        return ResponseFormatter.success(
-            data=department,
-            message="Department details retrieved",
-            request_id=request_id
+    if not department:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Department not found"
         )
-    except HRMSException:
-        raise
-    except Exception as e:
-        raise HRMSException(
-            error_code=ErrorCodes.INTERNAL_SERVER_ERROR,
-            message="Failed to fetch department",
-            http_status=status.HTTP_500_INTERNAL_SERVER_ERROR
-        )
+    return department
 
-
-@router.put("/departments/{department_id}")
+@router.put("/departments/{department_id}", response_model=schemas.DepartmentResponse)
 def update_department(
     department_id: int,
-    payload: DepartmentUpdate,
-    request: Request,
-    current_user: dict = Depends(require_roles("admin", "hr_manager")),
-    db: Session = Depends(get_db)
+    department_in: schemas.DepartmentUpdate,
+    db: Session = Depends(get_db),
 ):
-    """Update department information"""
-    request_id = RequestContextManager.get_request_id()
-    client_ip, user_agent = RequestContextManager.get_client_info(request)
+    """Update department"""
+    department = db.query(models.Department).filter(
+        models.Department.id == department_id
+    ).first()
     
-    try:
-        existing_department = services.get_department_by_id(db, department_id)
-        if not existing_department:
-            raise ResourceNotFoundError("Department", department_id)
-        
-        old_values = {"name": existing_department.name}
-        
-        department = services.update_department(db, department_id, payload)
-        db.commit()
-        
-        # Audit log
-        AuditLogger.log_action(
-            db=db,
-            user_id=current_user["user_id"],
-            user_phone=current_user["phone_number"],
-            module="employee",
-            action="update",
-            resource_type="Department",
-            resource_id=department.id,
-            ip_address=client_ip,
-            user_agent=user_agent,
-            old_values=old_values,
-            new_values={"name": department.name},
-            status_str="success"
+    if not department:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Department not found"
         )
-        
-        return ResponseFormatter.success(
-            data=department,
-            message="Department updated successfully",
-            request_id=request_id
-        )
-    except HRMSException:
-        db.rollback()
-        raise
-    except services.DuplicateError as e:
-        db.rollback()
-        raise DuplicateError("Department", field="name")
-    except Exception as e:
-        db.rollback()
-        raise HRMSException(
-            error_code=ErrorCodes.INTERNAL_SERVER_ERROR,
-            message="Failed to update department",
-            http_status=status.HTTP_500_INTERNAL_SERVER_ERROR
-        )
-
+    
+    # Update fields
+    update_data = department_in.model_dump(exclude_unset=True)
+    for field, value in update_data.items():
+        setattr(department, field, value)
+    
+    db.add(department)
+    db.commit()
+    db.refresh(department)
+    
+    return department
 
 @router.delete("/departments/{department_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_department(
     department_id: int,
-    request: Request,
-    current_user: dict = Depends(require_roles("admin")),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
     """Delete department"""
-    client_ip, user_agent = RequestContextManager.get_client_info(request)
+    department = db.query(models.Department).filter(
+        models.Department.id == department_id
+    ).first()
     
-    try:
-        existing_department = services.get_department_by_id(db, department_id)
-        if not existing_department:
-            raise ResourceNotFoundError("Department", department_id)
-        
-        services.delete_department(db, department_id)
-        db.commit()
-        
-        # Audit log
-        AuditLogger.log_action(
-            db=db,
-            user_id=current_user["user_id"],
-            user_phone=current_user["phone_number"],
-            module="employee",
-            action="delete",
-            resource_type="Department",
-            resource_id=department_id,
-            ip_address=client_ip,
-            user_agent=user_agent,
-            status_str="success"
+    if not department:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Department not found"
         )
-        
-        return None
-    except HRMSException:
-        db.rollback()
-        raise
-    except Exception as e:
-        db.rollback()
-        raise HRMSException(
-            error_code=ErrorCodes.INTERNAL_SERVER_ERROR,
-            message="Failed to delete department",
-            http_status=status.HTTP_500_INTERNAL_SERVER_ERROR
-        )
+    
+    db.delete(department)
+    db.commit()
+    
+    return None
 
-
-# ============================================================================
-# DESIGNATION ENDPOINTS
-# ============================================================================
-
-@router.post("/designations", status_code=status.HTTP_201_CREATED)
+# ==================== Designation Routes ====================
+@router.post("/designations", response_model=schemas.DesignationResponse, status_code=status.HTTP_201_CREATED)
 def create_designation(
-    payload: DesignationCreate,
-    request: Request,
-    current_user: dict = Depends(require_roles("admin", "hr_manager")),
-    db: Session = Depends(get_db)
+    designation_in: schemas.DesignationCreate,
+    db: Session = Depends(get_db),
 ):
     """Create a new designation"""
-    request_id = RequestContextManager.get_request_id()
-    client_ip, user_agent = RequestContextManager.get_client_info(request)
+    # Check if designation exists
+    existing = db.query(models.Designation).filter(
+        models.Designation.title == designation_in.title
+    ).first()
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Designation with this title already exists"
+        )
     
-    try:
-        if not payload.title or len(payload.title.strip()) == 0:
-            raise ValidationError("Designation title is required", field="title")
-        
-        designation = services.create_designation_service(db, payload)
-        db.commit()
-        
-        # Audit log
-        AuditLogger.log_action(
-            db=db,
-            user_id=current_user["user_id"],
-            user_phone=current_user["phone_number"],
-            module="employee",
-            action="create",
-            resource_type="Designation",
-            resource_id=designation.id,
-            ip_address=client_ip,
-            user_agent=user_agent,
-            new_values={"title": designation.title},
-            status_str="success"
-        )
-        
-        return ResponseFormatter.created(
-            data=designation,
-            message="Designation created successfully",
-            request_id=request_id
-        )
-    except HRMSException:
-        db.rollback()
-        raise
-    except services.DuplicateError as e:
-        db.rollback()
-        raise DuplicateError("Designation", field="title")
-    except Exception as e:
-        db.rollback()
-        raise HRMSException(
-            error_code=ErrorCodes.INTERNAL_SERVER_ERROR,
-            message="Failed to create designation",
-            http_status=status.HTTP_500_INTERNAL_SERVER_ERROR
-        )
+    # Create designation
+    db_designation = models.Designation(**designation_in.model_dump())
+    db.add(db_designation)
+    db.commit()
+    db.refresh(db_designation)
+    
+    return db_designation
 
-
-@router.get("/designations")
-def list_designations(
-    request: Request,
+@router.get("/designations", response_model=List[schemas.DesignationResponse])
+def read_designations(
     skip: int = Query(0, ge=0),
-    limit: int = Query(50, ge=1, le=500),
-    current_user: dict = Depends(require_roles()),
-    db: Session = Depends(get_db)
+    limit: int = Query(100, ge=1, le=100),
+    db: Session = Depends(get_db),
 ):
-    """List all designations with pagination"""
-    request_id = RequestContextManager.get_request_id()
-    
-    try:
-        result = services.list_designations(db, skip=skip, limit=limit)
-        total = result.get("total", 0)
-        designations = result.get("data", [])
-        
-        return ResponseFormatter.paginated(
-            items=designations,
-            total=total,
-            skip=skip,
-            limit=limit,
-            message="Designations retrieved successfully",
-            request_id=request_id
-        )
-    except HRMSException:
-        raise
-    except Exception as e:
-        raise HRMSException(
-            error_code=ErrorCodes.INTERNAL_SERVER_ERROR,
-            message="Failed to fetch designations",
-            http_status=status.HTTP_500_INTERNAL_SERVER_ERROR
-        )
+    """Get all designations"""
+    designations = db.query(models.Designation).offset(skip).limit(limit).all()
+    return designations
 
-
-@router.get("/designations/{designation_id}")
-def get_designation(
+@router.get("/designations/{designation_id}", response_model=schemas.DesignationResponse)
+def read_designation(
     designation_id: int,
-    request: Request,
-    current_user: dict = Depends(require_roles()),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
     """Get designation by ID"""
-    request_id = RequestContextManager.get_request_id()
+    designation = db.query(models.Designation).filter(
+        models.Designation.id == designation_id
+    ).first()
     
-    try:
-        designation = services.get_designation_by_id(db, designation_id)
-        if not designation:
-            raise ResourceNotFoundError("Designation", designation_id)
-        
-        return ResponseFormatter.success(
-            data=designation,
-            message="Designation details retrieved",
-            request_id=request_id
+    if not designation:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Designation not found"
         )
-    except HRMSException:
-        raise
-    except Exception as e:
-        raise HRMSException(
-            error_code=ErrorCodes.INTERNAL_SERVER_ERROR,
-            message="Failed to fetch designation",
-            http_status=status.HTTP_500_INTERNAL_SERVER_ERROR
-        )
+    return designation
 
-
-@router.put("/designations/{designation_id}")
+@router.put("/designations/{designation_id}", response_model=schemas.DesignationResponse)
 def update_designation(
     designation_id: int,
-    payload: DesignationUpdate,
-    request: Request,
-    current_user: dict = Depends(require_roles("admin", "hr_manager")),
-    db: Session = Depends(get_db)
+    designation_in: schemas.DesignationUpdate,
+    db: Session = Depends(get_db),
 ):
-    """Update designation information"""
-    request_id = RequestContextManager.get_request_id()
-    client_ip, user_agent = RequestContextManager.get_client_info(request)
+    """Update designation"""
+    designation = db.query(models.Designation).filter(
+        models.Designation.id == designation_id
+    ).first()
     
-    try:
-        existing_designation = services.get_designation_by_id(db, designation_id)
-        if not existing_designation:
-            raise ResourceNotFoundError("Designation", designation_id)
-        
-        old_values = {"title": existing_designation.title}
-        
-        designation = services.update_designation(db, designation_id, payload)
-        db.commit()
-        
-        # Audit log
-        AuditLogger.log_action(
-            db=db,
-            user_id=current_user["user_id"],
-            user_phone=current_user["phone_number"],
-            module="employee",
-            action="update",
-            resource_type="Designation",
-            resource_id=designation.id,
-            ip_address=client_ip,
-            user_agent=user_agent,
-            old_values=old_values,
-            new_values={"title": designation.title},
-            status_str="success"
+    if not designation:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Designation not found"
         )
-        
-        return ResponseFormatter.success(
-            data=designation,
-            message="Designation updated successfully",
-            request_id=request_id
-        )
-    except HRMSException:
-        db.rollback()
-        raise
-    except services.DuplicateError as e:
-        db.rollback()
-        raise DuplicateError("Designation", field="title")
-    except Exception as e:
-        db.rollback()
-        raise HRMSException(
-            error_code=ErrorCodes.INTERNAL_SERVER_ERROR,
-            message="Failed to update designation",
-            http_status=status.HTTP_500_INTERNAL_SERVER_ERROR
-        )
-
+    
+    # Update fields
+    update_data = designation_in.model_dump(exclude_unset=True)
+    for field, value in update_data.items():
+        setattr(designation, field, value)
+    
+    db.add(designation)
+    db.commit()
+    db.refresh(designation)
+    
+    return designation
 
 @router.delete("/designations/{designation_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_designation(
     designation_id: int,
-    request: Request,
-    current_user: dict = Depends(require_roles("admin")),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
     """Delete designation"""
-    client_ip, user_agent = RequestContextManager.get_client_info(request)
+    designation = db.query(models.Designation).filter(
+        models.Designation.id == designation_id
+    ).first()
     
-    try:
-        existing_designation = services.get_designation_by_id(db, designation_id)
-        if not existing_designation:
-            raise ResourceNotFoundError("Designation", designation_id)
-        
-        services.delete_designation(db, designation_id)
-        db.commit()
-        
-        # Audit log
-        AuditLogger.log_action(
-            db=db,
-            user_id=current_user["user_id"],
-            user_phone=current_user["phone_number"],
-            module="employee",
-            action="delete",
-            resource_type="Designation",
-            resource_id=designation_id,
-            ip_address=client_ip,
-            user_agent=user_agent,
-            status_str="success"
+    if not designation:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Designation not found"
         )
-        
-        return None
-    except HRMSException:
-        db.rollback()
-        raise
-    except Exception as e:
-        db.rollback()
-        raise HRMSException(
-            error_code=ErrorCodes.INTERNAL_SERVER_ERROR,
-            message="Failed to delete designation",
-            http_status=status.HTTP_500_INTERNAL_SERVER_ERROR
-        )
+    
+    db.delete(designation)
+    db.commit()
+    
+    return None
 
-
-# Employee endpoints
-@router.post("/employees", response_model=EmployeeOut, status_code=status.HTTP_201_CREATED)
+# ==================== Employee Routes ====================
+@router.post("/employees", response_model=schemas.EmployeeResponse, status_code=status.HTTP_201_CREATED)
 def create_employee(
-    payload: EmployeeCreate,
-    db: Session = Depends(get_db)
+    employee_in: schemas.EmployeeCreate,
+    db: Session = Depends(get_db),
 ):
-    """Create a new employee"""
-    try:
-        employee = services.create_employee_service(db, payload)
-        db.commit()
-        return employee
-    except services.NotFoundError as e:
-        db.rollback()
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
-    except services.DuplicateError as e:
-        db.rollback()
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
-    except services.EmployeeServiceError as e:
-        db.rollback()
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal server error")
+    """Create a new employee with all details"""
+    
 
+    
+    # Check if user exists and doesn't have employee record
+    user = db.query(User).filter(User.id == employee_in.user_id).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+    employee_in.employee_code = user.employee_code
 
-@router.get("/employees/{employee_id}", response_model=EmployeeDetailOut)
-def get_employee(
+    
+    # Create employee
+    employee_data = employee_in.model_dump(exclude={
+        'bank_detail', 'employee_personal_detail', 
+        'employee_document_detail', 'employee_profile'
+    })
+    db_employee = models.Employee(**employee_data)
+    db.add(db_employee)
+    db.flush()  # Get employee ID
+    
+    # Create bank detail
+    if employee_in.bank_detail:
+        bank_detail_data = employee_in.bank_detail.model_dump()
+        db_bank_detail = models.BankDetail(**bank_detail_data, employee_id=db_employee.id)
+        db.add(db_bank_detail)
+    
+    # Create personal detail
+    if employee_in.employee_personal_detail:
+        personal_detail_data = employee_in.employee_personal_detail.model_dump()
+        db_personal_detail = models.EmployeePersonalDetail(
+            **personal_detail_data, 
+            employee_id=db_employee.id
+        )
+        db.add(db_personal_detail)
+    
+    # Create document detail
+    if employee_in.employee_document_detail:
+        document_detail_data = employee_in.employee_document_detail.model_dump()
+        db_document_detail = models.EmployeeDocumentDetail(
+            **document_detail_data, 
+            employee_id=db_employee.id
+        )
+        db.add(db_document_detail)
+    
+    # Create profile
+    if employee_in.employee_profile:
+        profile_data = employee_in.employee_profile.model_dump()
+        db_profile = models.EmployeeProfile(
+            **profile_data, 
+            employee_id=db_employee.id
+        )
+        db.add(db_profile)
+    
+    db.commit()
+    db.refresh(db_employee)
+    
+    return db_employee
+
+@router.put("/employees/{employee_id}", response_model=schemas.EmployeeResponse)
+def update_employee(
     employee_id: int,
-    db: Session = Depends(get_db)
+    employee_in: schemas.EmployeeUpdate,
+    db: Session = Depends(get_db),
 ):
-    """Get employee by ID"""
-    try:
-        employee = services.get_employee_by_id(db, employee_id)
-        if not employee:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Employee not found")
-        return employee
-    except services.EmployeeServiceError as e:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal server error")
+    """Update employee details"""
+    employee = db.query(models.Employee).filter(
+        models.Employee.id == employee_id
+    ).first()
+    
+    if not employee:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Employee not found"
+        )
+    
+    # Update employee fields
+    update_data = employee_in.model_dump(exclude_unset=True, exclude={
+        'bank_detail', 'employee_personal_detail', 
+        'employee_document_detail', 'employee_profile'
+    })
+    
+    for field, value in update_data.items():
+        setattr(employee, field, value)
+    
+    # Update bank detail
+    if employee_in.bank_detail:
+        if employee.bank_detail:
+            for field, value in employee_in.bank_detail.model_dump(exclude_unset=True).items():
+                setattr(employee.bank_detail, field, value)
+        else:
+            bank_detail_data = employee_in.bank_detail.model_dump()
+            db_bank_detail = models.BankDetail(**bank_detail_data, employee_id=employee.id)
+            db.add(db_bank_detail)
+    
+    # Update personal detail
+    if employee_in.employee_personal_detail:
+        if employee.employee_personal_detail:
+            for field, value in employee_in.employee_personal_detail.model_dump(exclude_unset=True).items():
+                setattr(employee.employee_personal_detail, field, value)
+        else:
+            personal_detail_data = employee_in.employee_personal_detail.model_dump()
+            db_personal_detail = models.EmployeePersonalDetail(
+                **personal_detail_data, 
+                employee_id=employee.id
+            )
+            db.add(db_personal_detail)
+    
+    # Update document detail
+    if employee_in.employee_document_detail:
+        if employee.employee_document_detail:
+            for field, value in employee_in.employee_document_detail.model_dump(exclude_unset=True).items():
+                setattr(employee.employee_document_detail, field, value)
+        else:
+            document_detail_data = employee_in.employee_document_detail.model_dump()
+            db_document_detail = models.EmployeeDocumentDetail(
+                **document_detail_data, 
+                employee_id=employee.id
+            )
+            db.add(db_document_detail)
+    
+    # Update profile
+    if employee_in.employee_profile:
+        if employee.employee_profile:
+            for field, value in employee_in.employee_profile.model_dump(exclude_unset=True).items():
+                setattr(employee.employee_profile, field, value)
+        else:
+            profile_data = employee_in.employee_profile.model_dump()
+            db_profile = models.EmployeeProfile(
+                **profile_data,
+                employee_id=employee.id
+            )
+            db.add(db_profile)
+
+    db.commit()
+    db.refresh(employee)
+
+    return employee
 
 
-@router.get("/employees", response_model=List[EmployeeDetailOut])
-def get_all_employees(
-    offset: int = Query(0, ge=0),
-    limit: int = Query(100, ge=1, le=1000),
+@router.get("/employees", response_model=List[schemas.EmployeeListResponse])
+def read_employees(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=100),
     department_id: Optional[int] = Query(None),
+    designation_id: Optional[int] = Query(None),
     is_active: Optional[bool] = Query(None),
-    db: Session = Depends(get_db)
+    search: Optional[str] = Query(None, min_length=1),
+    db: Session = Depends(get_db),
 ):
-    """Get all employees with optional filters"""
-    try:
-        return services.get_all_employees(
-            db=db,
-            skip=offset, 
-            limit=limit, 
-            department_id=department_id,
-            is_active=is_active
+    """Get all employees with filters"""
+    
+    query = db.query(models.Employee)
+    
+    # Apply filters
+    if department_id:
+        query = query.filter(models.Employee.department_id == department_id)
+    
+    if designation_id:
+        query = query.filter(models.Employee.designation_id == designation_id)
+    
+    if is_active is not None:
+        query = query.filter(models.Employee.is_active == is_active)
+    
+    if search:
+        query = query.join(models.User).filter(
+            or_(
+                models.User.first_name.ilike(f"%{search}%"),
+                models.User.last_name.ilike(f"%{search}%"),
+                models.Employee.employee_code.ilike(f"%{search}%")
+            )
         )
-    except services.EmployeeServiceError as e:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal server error")
+    
+    employees = query.offset(skip).limit(limit).all()
+    
+    return employees
 
-
-@router.put("/employees/{employee_id}", response_model=EmployeeOut)
-def update_employee(
-    employee_id: int, 
-    payload: EmployeeUpdate,
-    db: Session = Depends(get_db)
+@router.get("/employees/{employee_id}", response_model=schemas.EmployeeResponse)
+def read_employee(
+    employee_id: int,
+    db: Session = Depends(get_db),
 ):
-    """Update employee information with all available fields"""
-    try:
-        employee = services.update_employee(db, employee_id, payload)
-        db.commit()
-        return employee
-    except services.NotFoundError as e:
-        db.rollback()
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
-    except services.DuplicateError as e:
-        db.rollback()
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
-    except services.EmployeeServiceError as e:
-        db.rollback()
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal server error")
+    """Get employee by ID with all details"""
     
+    employee = db.query(models.Employee).filter(
+        models.Employee.id == employee_id
+    ).first()
+    
+    if not employee:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Employee not found"
+        )
+    
+    return employee
 
+@router.get("/employees/by-code/{employee_code}", response_model=schemas.EmployeeResponse)
+def read_employee_by_code(
+    employee_code: str,
+    db: Session = Depends(get_db),
+):
+    """Get employee by employee code"""
     
+    employee = db.query(models.Employee).filter(
+        models.Employee.employee_code == employee_code
+    ).first()
+    
+    if not employee:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Employee not found"
+        )
+    
+    return employee
+
+@router.put("/employees/{employee_id}", response_model=schemas.EmployeeResponse)
+def update_employee(
+    employee_id: int,
+    employee_in: schemas.EmployeeUpdate,
+    db: Session = Depends(get_db),
+):
+    """Update employee details"""
+    
+    employee = db.query(models.Employee).filter(
+        models.Employee.id == employee_id
+    ).first()
+    
+    if not employee:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Employee not found"
+        )
+    
+    # Update employee fields
+    update_data = employee_in.model_dump(exclude_unset=True, exclude={
+        'bank_detail', 'employee_personal_detail', 
+        'employee_document_detail', 'employee_profile'
+    })
+    
+    for field, value in update_data.items():
+        setattr(employee, field, value)
+    
+    # Update bank detail
+    if employee_in.bank_detail:
+        if employee.bank_detail:
+            for field, value in employee_in.bank_detail.model_dump(exclude_unset=True).items():
+                setattr(employee.bank_detail, field, value)
+        else:
+            bank_detail_data = employee_in.bank_detail.model_dump()
+            db_bank_detail = models.BankDetail(**bank_detail_data, employee_id=employee.id)
+            db.add(db_bank_detail)
+    
+    # Update personal detail
+    if employee_in.employee_personal_detail:
+        if employee.employee_personal_detail:
+            for field, value in employee_in.employee_personal_detail.model_dump(exclude_unset=True).items():
+                setattr(employee.employee_personal_detail, field, value)
+        else:
+            personal_detail_data = employee_in.employee_personal_detail.model_dump()
+            db_personal_detail = models.EmployeePersonalDetail(
+                **personal_detail_data, 
+                employee_id=employee.id
+            )
+            db.add(db_personal_detail)
+    
+    # Update document detail
+    if employee_in.employee_document_detail:
+        if employee.employee_document_detail:
+            for field, value in employee_in.employee_document_detail.model_dump(exclude_unset=True).items():
+                setattr(employee.employee_document_detail, field, value)
+        else:
+            document_detail_data = employee_in.employee_document_detail.model_dump()
+            db_document_detail = models.EmployeeDocumentDetail(
+                **document_detail_data, 
+                employee_id=employee.id
+            )
+            db.add(db_document_detail)
+    
+    # Update profile
+    if employee_in.employee_profile:
+        if employee.employee_profile:
+            for field, value in employee_in.employee_profile.model_dump(exclude_unset=True).items():
+                setattr(employee.employee_profile, field, value)
+        else:
+            profile_data = employee_in.employee_profile.model_dump()
+            db_profile = models.EmployeeProfile(
+                **profile_data, 
+                employee_id=employee.id
+            )
+            db.add(db_profile)
+    
+    db.add(employee)
+    db.commit()
+    db.refresh(employee)
+    
+    return employee
+
 @router.delete("/employees/{employee_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_employee(
     employee_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
-    """Soft delete employee"""
-    try:
-        services.delete_employee(db, employee_id)
-        db.commit()
-        return None
-    except services.NotFoundError as e:
-        db.rollback()
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
-    except services.EmployeeServiceError as e:
-        db.rollback()
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal server error")
+    """Delete employee (CASCADE will delete related records)"""
+    
+    employee = db.query(models.Employee).filter(
+        models.Employee.id == employee_id
+    ).first()
+    
+    if not employee:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Employee not found"
+        )
+    
+    db.delete(employee)
+    db.commit()
+    
+    return None
 
-
-# Department endpoints
-@router.post("/departments", response_model=DepartmentOut, status_code=status.HTTP_201_CREATED)
-def create_department(
-    payload: DepartmentCreate,
-    db: Session = Depends(get_db)
+# ==================== Employee Statistics Routes ====================
+@router.get("/statistics/dashboard")
+def get_employee_statistics(
+    db: Session = Depends(get_db),
 ):
-    """Create a new department"""
-    try:
-        department = services.create_department_service(db, payload)
-        db.commit()
-        return department
-    except services.DuplicateError as e:
-        db.rollback()
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
-    except services.EmployeeServiceError as e:
-        db.rollback()
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal server error")
+    """Get employee statistics for dashboard"""
+    
+    total_employees = db.query(models.Employee).count()
+    active_employees = db.query(models.Employee).filter(
+        models.Employee.is_active == True
+    ).count()
+    
+    # Department wise count
+    departments = db.query(models.Department).all()
+    dept_stats = []
+    for dept in departments:
+        count = db.query(models.Employee).filter(
+            models.Employee.department_id == dept.id
+        ).count()
+        dept_stats.append({
+            "department_id": dept.id,
+            "department_name": dept.name,
+            "employee_count": count
+        })
+    
+    # Designation wise count
+    designations = db.query(models.Designation).all()
+    desig_stats = []
+    for desig in designations:
+        count = db.query(models.Employee).filter(
+            models.Employee.designation_id == desig.id
+        ).count()
+        desig_stats.append({
+            "designation_id": desig.id,
+            "designation_title": desig.title,
+            "employee_count": count
+        })
+    
+    return {
+        "total_employees": total_employees,
+        "active_employees": active_employees,
+        "inactive_employees": total_employees - active_employees,
+        "department_wise": dept_stats,
+        "designation_wise": desig_stats
+    }
 
-
-@router.get("/departments", response_model=List[DepartmentOut])
-def list_departments(
-    skip: int = Query(0, ge=0),
-    limit: int = Query(100, ge=1, le=1000),
-    db: Session = Depends(get_db)
+# ==================== Organization Hierarchy Routes ====================
+@router.get("/hierarchy/{employee_id}")
+def get_employee_hierarchy(
+    employee_id: int,
+    db: Session = Depends(get_db),
 ):
-    """List all departments"""
-    try:
-        departments = services.list_departments(db, skip=skip, limit=limit)
-        
-        # Add employee count
-        result = []
-        for dept in departments:
-            dept_dict = {
-                "id": dept.id,
-                "name": dept.name,
-                "description": dept.description,
-                "created_at": dept.created_at,
-                "updated_at": dept.updated_at,
-                "employee_count": dept.employees.count() if hasattr(dept, 'employees') else 0
+    """Get employee reporting hierarchy"""
+    
+    employee = db.query(models.Employee).filter(
+        models.Employee.id == employee_id
+    ).first()
+    
+    if not employee:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Employee not found"
+        )
+    
+    hierarchy = []
+    current = employee
+    
+    while current.manager:
+        hierarchy.append({
+            "id": current.manager.id,
+            "name": current.manager.full_name,
+            "employee_code": current.manager.employee_code,
+            "designation": current.manager.designation.title if current.manager.designation else None,
+            "department": current.manager.department.name if current.manager.department else None
+        })
+        current = current.manager
+    
+    # Get subordinates
+    subordinates = db.query(models.Employee).filter(
+        models.Employee.manager_id == employee_id
+    ).all()
+    
+    subordinate_list = []
+    for sub in subordinates:
+        subordinate_list.append({
+            "id": sub.id,
+            "name": sub.full_name,
+            "employee_code": sub.employee_code,
+            "designation": sub.designation.title if sub.designation else None,
+            "department": sub.department.name if sub.department else None
+        })
+    
+    return {
+        "employee": {
+            "id": employee.id,
+            "name": employee.full_name,
+            "employee_code": employee.employee_code,
+            "designation": employee.designation.title if employee.designation else None,
+            "department": employee.department.name if employee.department else None
+        },
+        "reporting_chain": hierarchy,
+        "subordinates": subordinate_list
+    }
+
+# ==================== Bulk Operations Routes ====================
+@router.post("/employees/bulk", response_model=List[schemas.EmployeeResponse], status_code=status.HTTP_201_CREATED)
+def create_employees_bulk(
+    employees_in: List[schemas.EmployeeCreate],
+    db: Session = Depends(get_db),
+):
+    """Create multiple employees in bulk"""
+    
+    created_employees = []
+    errors = []
+    
+    for idx, employee_in in enumerate(employees_in):
+        try:
+            # Check if employee code exists
+            existing = db.query(models.Employee).filter(
+                models.Employee.employee_code == employee_in.employee_code
+            ).first()
+            if existing:
+                errors.append({
+                    "index": idx,
+                    "employee_code": employee_in.employee_code,
+                    "error": "Employee code already exists"
+                })
+                continue
+            
+            # Check if user exists
+            user = db.query(User).filter(User.id == employee_in.user_id).first()
+            if not user:
+                errors.append({
+                    "index": idx,
+                    "employee_code": employee_in.employee_code,
+                    "error": "User not found"
+                })
+                continue
+            
+            # Create employee
+            employee_data = employee_in.model_dump(exclude={
+                'bank_detail', 'employee_personal_detail', 
+                'employee_document_detail', 'employee_profile'
+            })
+            db_employee = models.Employee(**employee_data)
+            db.add(db_employee)
+            db.flush()
+            
+            # Create related details
+            if employee_in.bank_detail:
+                db_bank = models.BankDetail(**employee_in.bank_detail.model_dump(), employee_id=db_employee.id)
+                db.add(db_bank)
+            
+            if employee_in.employee_personal_detail:
+                db_personal = models.EmployeePersonalDetail(
+                    **employee_in.employee_personal_detail.model_dump(), 
+                    employee_id=db_employee.id
+                )
+                db.add(db_personal)
+            
+            if employee_in.employee_document_detail:
+                db_doc = models.EmployeeDocumentDetail(
+                    **employee_in.employee_document_detail.model_dump(), 
+                    employee_id=db_employee.id
+                )
+                db.add(db_doc)
+            
+            if employee_in.employee_profile:
+                db_profile = models.EmployeeProfile(
+                    **employee_in.employee_profile.model_dump(), 
+                    employee_id=db_employee.id
+                )
+                db.add(db_profile)
+            
+            created_employees.append(db_employee)
+            
+        except Exception as e:
+            errors.append({
+                "index": idx,
+                "employee_code": employee_in.employee_code,
+                "error": str(e)
+            })
+    
+    db.commit()
+    
+    # Refresh all created employees
+    for employee in created_employees:
+        db.refresh(employee)
+    
+    if errors:
+        raise HTTPException(
+            status_code=status.HTTP_207_MULTI_STATUS,
+            detail={
+                "message": "Bulk operation completed with errors",
+                "created": len(created_employees),
+                "errors": errors
             }
-            result.append(DepartmentOut.model_validate(dept_dict))
+        )
+    
+    return created_employees
+
+# ==================== Export Routes ====================
+@router.get("/export/employees")
+def export_employees(
+    format: str = Query("json", regex="^(json|csv)$"),
+    department_id: Optional[int] = Query(None),
+    db: Session = Depends(get_db),
+):
+    """Export employee data in JSON or CSV format"""
+    
+    query = db.query(models.Employee)
+    
+    if department_id:
+        query = query.filter(models.Employee.department_id == department_id)
+    
+    employees = query.all()
+    
+    export_data = []
+    for emp in employees:
+        export_data.append({
+            "employee_code": emp.employee_code,
+            "full_name": emp.full_name,
+            "email": emp.user.email if emp.user else None,
+            "department": emp.department.name if emp.department else None,
+            "designation": emp.designation.title if emp.designation else None,
+            "date_of_joining": emp.date_of_joining,
+            "is_active": emp.is_active,
+            "bank_account": emp.bank_detail.bank_account_number if emp.bank_detail else None,
+            "pan_number": emp.employee_document_detail.pancard_number if emp.employee_document_detail else None,
+            "aadhar_number": emp.employee_document_detail.aadhar_number if emp.employee_document_detail else None
+        })
+    
+    if format == "csv":
+        import csv
+        from fastapi.responses import StreamingResponse
+        import io
         
-        return result
-    except services.EmployeeServiceError as e:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal server error")
-
-
-@router.get("/departments/{department_id}", response_model=DepartmentOut)
-def get_department(
-    department_id: int,
-    db: Session = Depends(get_db)
-):
-    """Get department by ID"""
-    try:
-        department = services.get_department_by_id(db, department_id)
-        if not department:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Department not found")
+        output = io.StringIO()
+        if export_data:
+            writer = csv.DictWriter(output, fieldnames=export_data[0].keys())
+            writer.writeheader()
+            writer.writerows(export_data)
         
-        dept_dict = {
-            "id": department.id,
-            "name": department.name,
-            "description": department.description,
-            "created_at": department.created_at,
-            "updated_at": department.updated_at,
-            "employee_count": department.employees.count() if hasattr(department, 'employees') else 0
-        }
-        return DepartmentOut.model_validate(dept_dict)
-    except services.EmployeeServiceError as e:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal server error")
-
-
-@router.put("/departments/{department_id}", response_model=DepartmentOut)
-def update_department(
-    department_id: int, 
-    payload: DepartmentUpdate,
-    db: Session = Depends(get_db)
-):
-    """Update department information"""
-    try:
-        department = services.update_department(db, department_id, payload)
-        db.commit()
-        
-        dept_dict = {
-            "id": department.id,
-            "name": department.name,
-            "description": department.description,
-            "created_at": department.created_at,
-            "updated_at": department.updated_at,
-            "employee_count": department.employees.count() if hasattr(department, 'employees') else 0
-        }
-        return DepartmentOut.model_validate(dept_dict)
-    except services.NotFoundError as e:
-        db.rollback()
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
-    except services.DuplicateError as e:
-        db.rollback()
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
-    except services.EmployeeServiceError as e:
-        db.rollback()
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal server error")
-
-
-@router.delete("/departments/{department_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_department(
-    department_id: int,
-    db: Session = Depends(get_db)
-):
-    """Delete department"""
-    try:
-        services.delete_department(db, department_id)
-        db.commit()
-        return None
-    except services.NotFoundError as e:
-        db.rollback()
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
-    except services.EmployeeServiceError as e:
-        db.rollback()
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal server error")
-
-
-# Designation endpoints
-@router.post("/designations", response_model=DesignationOut, status_code=status.HTTP_201_CREATED)
-def create_designation(
-    payload: DesignationCreate,
-    db: Session = Depends(get_db)
-):
-    """Create a new designation"""
-    try:
-        designation = services.create_designation_service(db, payload)
-        db.commit()
-        return designation
-    except services.DuplicateError as e:
-        db.rollback()
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
-    except services.EmployeeServiceError as e:
-        db.rollback()
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal server error")
-
-
-@router.get("/designations", response_model=List[DesignationOut])
-def list_designations(
-    skip: int = Query(0, ge=0),
-    limit: int = Query(100, ge=1, le=1000),
-    db: Session = Depends(get_db)
-):
-    """List all designations"""
-    try:
-        designations = services.list_designations(db, skip=skip, limit=limit)
-        
-        # Add employee count
-        result = []
-        for des in designations:
-            des_dict = {
-                "id": des.id,
-                "title": des.title,
-                "description": des.description,
-                "created_at": des.created_at,
-                "updated_at": des.updated_at,
-                "employee_count": des.employees.count() if hasattr(des, 'employees') else 0
-            }
-            result.append(DesignationOut.model_validate(des_dict))
-        
-        return result
-    except services.EmployeeServiceError as e:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal server error")
-
-
-@router.get("/designations/{designation_id}", response_model=DesignationOut)
-def get_designation(
-    designation_id: int,
-    db: Session = Depends(get_db)
-):
-    """Get designation by ID"""
-    try:
-        designation = services.get_designation_by_id(db, designation_id)
-        if not designation:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Designation not found")
-        
-        des_dict = {
-            "id": designation.id,
-            "title": designation.title,
-            "description": designation.description,
-            "created_at": designation.created_at,
-            "updated_at": designation.updated_at,
-            "employee_count": designation.employees.count() if hasattr(designation, 'employees') else 0
-        }
-        return DesignationOut.model_validate(des_dict)
-    except services.EmployeeServiceError as e:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal server error")
-
-
-@router.put("/designations/{designation_id}", response_model=DesignationOut)
-def update_designation(
-    designation_id: int, 
-    payload: DesignationUpdate,
-    db: Session = Depends(get_db)
-):
-    """Update designation information"""
-    try:
-        designation = services.update_designation(db, designation_id, payload)
-        db.commit()
-        
-        des_dict = {
-            "id": designation.id,
-            "title": designation.title,
-            "description": designation.description,
-            "created_at": designation.created_at,
-            "updated_at": designation.updated_at,
-            "employee_count": designation.employees.count() if hasattr(designation, 'employees') else 0
-        }
-        return DesignationOut.model_validate(des_dict)
-    except services.NotFoundError as e:
-        db.rollback()
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
-    except services.DuplicateError as e:
-        db.rollback()
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
-    except services.EmployeeServiceError as e:
-        db.rollback()
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal server error")
-
-
-@router.delete("/designations/{designation_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_designation(
-    designation_id: int,
-    db: Session = Depends(get_db)
-):
-    """Delete designation"""
-    try:
-        services.delete_designation(db, designation_id)
-        db.commit()
-        return None
-    except services.NotFoundError as e:
-        db.rollback()
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
-    except services.EmployeeServiceError as e:
-        db.rollback()
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal server error")
+        output.seek(0)
+        return StreamingResponse(
+            iter([output.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=employees_export.csv"}
+        )
+    
+    return export_data

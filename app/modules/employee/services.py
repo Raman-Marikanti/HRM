@@ -153,16 +153,7 @@ def create_employee_service(db: Session, employee_data: EmployeeCreate) -> Emplo
             user_id = existing_user.id
         else:
             # Create new user (password will be set by auth module separately)
-            user = User(
-                first_name=employee_data.first_name,
-                last_name=employee_data.last_name,
-                email=employee_data.email,
-                phone_number=employee_data.phone_number
-            )
-            db.add(user)
-            db.flush()  # Get user.id without committing
-            user_id = user.id
-        
+            raise ValueError("User does not exist. Please create user first before creating employee.")
         # Resolve department and designation
         dep_id = _resolve_fk(employee_data.department, Department, db)
         desig_id = _resolve_fk(employee_data.designation, Designation, db)
@@ -173,6 +164,10 @@ def create_employee_service(db: Session, employee_data: EmployeeCreate) -> Emplo
             employee_code=user_id.employee_code,
             department_id=dep_id,
             designation_id=desig_id,
+            date_of_joining=employee_data.date_of_joining,
+            date_of_leaving=employee_data.date_of_leaving,
+            is_active=employee_data.is_active,
+            manager_id=employee_data.manager_id,
         )
         db.add(new_employee)
         db.flush()

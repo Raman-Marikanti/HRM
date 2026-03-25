@@ -109,6 +109,8 @@ def create_defualt_departments_and_designations():
     finally:
         session.close()
 
+def create_defult_employee()
+
 if __name__ == '__main__':
     create_admin()
     create_defualt_departments_and_designations()

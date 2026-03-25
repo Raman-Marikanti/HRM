@@ -82,7 +82,7 @@ def root():
 
 
 app.include_router(auth_router)
-# app.include_router(emp_router)
+app.include_router(emp_router)
 # app.include_router(attendance_router)
 
 
