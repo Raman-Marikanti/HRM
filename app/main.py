@@ -6,11 +6,13 @@ from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 import logging
 
+from sqlalchemy import inspect
+
 from app.modules.admin import router as auth_router
 from app.modules.admin.models import User
 from app.modules.employee import emp_router, emp_auth_router
 from app.modules.attendance import attendance_router
-from app.core.database import engine
+from app.core.database import engine, init_models, init_models
 from app.core.database import SessionLocal
 
 from app.core.config import DATABASE_URL
@@ -91,6 +93,19 @@ app.include_router(attendance_router)
 @app.on_event("startup")
 async def on_startup():
     try:
+        required_tables = [
+            "users",
+            "employees",
+            "attendance_records",
+            "attendance_settings",
+            "attendance_imports",
+        ]
+
+        existing_tables = inspect(engine).get_table_names()
+
+        if not all(table in existing_tables for table in required_tables):
+            logger.info("Initializing database tables...")
+            init_models()
         from scripts.create_admin import create_admin, create_defualt_departments_and_designations
         session = SessionLocal()
         admin = session.query(select(User)).filter(User.employee_code == 'admin').first()
