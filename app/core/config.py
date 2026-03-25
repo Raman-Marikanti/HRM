@@ -6,7 +6,7 @@ load_dotenv()
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
     # A sensible default for local development if user doesn't set POSTGRES URL.
-     "postgresql+psycopg://postgres:postgres@localhost:5432/hrms",
+     "postgresql+psycopg://postgres:admin@localhost:5432/hrms",
    # "postgresql+psycopg://odoo:odoo@localhost:5432/data",
 
 )

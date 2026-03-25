@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status, UploadFile
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, or_, func, desc
 from typing import Optional, List
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from app.core.database import get_db
 from app.modules.attendance import models, schemas
 from app.modules.employee.models import Employee, Department
@@ -52,7 +52,7 @@ def check_in(
     ).first()
     
     if existing_attendance:
-        if existing_attendance.check_in_time:
+        if existing_attendance.check_in_time and not existing_attendance.is_checked_out:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Already checked in today"
@@ -107,7 +107,9 @@ def check_out(
         and_(
             models.Attendance.employee_id == check_out_data.employee_id,
             models.Attendance.date >= today,
-            models.Attendance.date < today + timedelta(days=1)
+            models.Attendance.date < today + timedelta(days=1),
+            
+            
         )
     ).first()
     
@@ -117,11 +119,11 @@ def check_out(
             detail="No check-in record found for today"
         )
     
-    if attendance.check_out_time:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Already checked out"
-        )
+    # if attendance.check_out_time :
+    #     raise HTTPException(
+    #         status_code=status.HTTP_400_BAD_REQUEST,
+    #         detail="Already checked out"
+    #     )
     
     # Update check-out time
     attendance.check_out_time = current_date
@@ -132,8 +134,18 @@ def check_out(
         attendance.remarks = check_out_data.remarks
     
     # Calculate working hours
+    check_in = attendance.check_in_time
+    check_out = attendance.check_out_time
+
+# ✅ make both timezone-aware (UTC)
+    if check_in and check_in.tzinfo is None:
+        check_in = check_in.replace(tzinfo=timezone.utc)
+
+    if check_out and check_out.tzinfo is None:
+        check_out = check_out.replace(tzinfo=timezone.utc)
+        
     if attendance.check_in_time:
-        duration = attendance.check_out_time - attendance.check_in_time
+        duration =check_out - check_in
         hours = duration.total_seconds() // 3600
         minutes = (duration.total_seconds() % 3600) // 60
         attendance.working_hours = f"{int(hours):02d}:{int(minutes):02d}:00"
@@ -148,30 +160,72 @@ def check_out(
     
     return attendance
 
-@router.get("/today/{employee_id}", response_model=schemas.AttendanceResponse)
-def get_today_attendance(
-    employee_id: int,
-    db: Session = Depends(get_db)
-):
-    """Get today's attendance for an employee"""
-    
-    today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-    
-    attendance = db.query(models.Attendance).filter(
+
+@router.get("/today/{employee_id}")
+def get_today_attendance(employee_id: int, db: Session = Depends(get_db)):
+    """Get today's first check-in, last check-out, and total working hours"""
+
+    # ✅ use timezone-aware
+    today = datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+
+    records = db.query(models.Attendance).filter(
         and_(
             models.Attendance.employee_id == employee_id,
-            models.Attendance.date >= today,
-            models.Attendance.date < today + timedelta(days=1)
+            models.Attendance.check_in_time >= today,
+            models.Attendance.check_in_time < today + timedelta(days=1)
         )
-    ).first()
-    
-    if not attendance:
+    ).order_by(models.Attendance.check_in_time.asc()).all()
+
+    if not records:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="No attendance record found for today"
         )
-    
-    return attendance
+
+   
+    first_check_in = records[0].check_in_time
+
+  
+    last_check_out = None
+    for r in reversed(records):
+        if r.check_out_time:
+            last_check_out = r.check_out_time
+            break
+
+    total_seconds = 0
+
+    for r in records:
+        if r.check_in_time and r.check_out_time:
+
+            check_in = r.check_in_time
+            check_out = r.check_out_time
+
+            # 🔥 normalize timezone (avoid your previous error)
+            if check_in.tzinfo is None:
+                check_in = check_in.replace(tzinfo=timezone.utc)
+            if check_out.tzinfo is None:
+                check_out = check_out.replace(tzinfo=timezone.utc)
+
+            diff = check_out - check_in
+            total_seconds += int(diff.total_seconds())
+
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    seconds = total_seconds % 60
+
+    total_working_hours = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+   
+    return {
+        "employee_id": employee_id,
+        "date": today.date(),
+        "first_check_in": first_check_in,
+        "last_check_out": last_check_out,
+        "total_working_hours": total_working_hours,
+        "sessions_count": len(records)
+    }
 
 # ==================== Attendance Records Routes ====================
 @router.get("/records", response_model=List[schemas.AttendanceDetailResponse])

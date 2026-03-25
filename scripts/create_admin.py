@@ -36,7 +36,6 @@ def create_admin():
             is_phone_verified=True,
             created_at=datetime.now(),
             updated_at=datetime.now(),
-            roles=['admin']
         )
         session.add(admin)
         session.commit()
@@ -109,7 +108,7 @@ def create_defualt_departments_and_designations():
     finally:
         session.close()
 
-def create_defult_employee()
+
 
 if __name__ == '__main__':
     create_admin()
