@@ -1,511 +1,672 @@
-from typing import List, Optional
-from datetime import date
-
-from fastapi import APIRouter, Depends, HTTPException, status, Query, Request
+# app/modules/attendance/routes.py
+from fastapi import APIRouter, Depends, HTTPException, Query, status, UploadFile, File
 from sqlalchemy.orm import Session
-
+from sqlalchemy import and_, or_, func, desc
+from typing import Optional, List
+from datetime import datetime, date, timedelta
 from app.core.database import get_db
-from app.core.rbac import require_roles, get_current_user
-from app.core.utils import ResponseFormatter, AuditLogger, RequestContextManager
-from app.modules.attendance import services
-from app.modules.attendance.schemas import (
-    # Attendance
-    AttendanceCreate, AttendanceOut, AttendanceDetailOut, AttendanceUpdate,
-    AttendanceCheckIn, AttendanceCheckOut, AttendanceSummary,
-    DateRange,
-    
-    # Leave
-    LeaveRequestCreate, LeaveRequestOut, LeaveRequestUpdate,
-    LeaveRequestApprove, LeaveBalance,
-    
-    # Holiday
-    HolidayCreate, HolidayOut, HolidayUpdate,
-    
-    # Work Shift
-    WorkShiftCreate, WorkShiftOut, WorkShiftUpdate,
-    EmployeeShiftAssign, EmployeeShiftOut
-)
-from app.modules.attendance.models import AttendanceStatus, LeaveStatus
+from app.modules.attendance import models, schemas
+from app.modules.employee.models import Employee, Department
+from app.modules.admin.models import User
 
-router = APIRouter(prefix="/attendance", tags=["Attendance"])
+import csv
+import io
+import json
 
+router = APIRouter(prefix="/attendance", tags=["Attendance Management"])
 
-# Helper function for error handling
-def handle_service_error(db: Session, func, *args, **kwargs):
-    """Helper function to handle service errors"""
-    try:
-        result = func(*args, **kwargs)
-        db.commit()
-        return result
-    except services.NotFoundError as e:
-        db.rollback()
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
-    except services.DuplicateError as e:
-        db.rollback()
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
-    except services.ValidationError as e:
-        db.rollback()
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-    except services.AttendanceServiceError as e:
-        db.rollback()
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Internal server error: {str(e)}")
-
-
-# Attendance Endpoints (Employee accessible)
-@router.post("/check-in", response_model=AttendanceOut, status_code=status.HTTP_201_CREATED)
+# ==================== Check-In/Check-Out Routes ====================
+@router.post("/check-in", response_model=schemas.AttendanceResponse, status_code=status.HTTP_201_CREATED)
 def check_in(
-    data: AttendanceCheckIn,
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(require_roles("employee", "admin", "hr"))
+    check_in_data: schemas.CheckInRequest,
+    db: Session = Depends(get_db)
 ):
-    """Record employee check-in (Employees, Admin, HR)"""
-    # Get employee ID from current user
-    if not current_user.get("employee_id"):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="User is not an employee")
+    """Employee check-in"""
     
-    return handle_service_error(db, services.check_in, db, current_user["employee_id"], data)
-
-
-@router.post("/check-out", response_model=AttendanceOut)
-def check_out(
-    data: AttendanceCheckOut,
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(require_roles("employee", "admin", "hr"))
-):
-    """Record employee check-out (Employees, Admin, HR)"""
-    if not current_user.get("employee_id"):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="User is not an employee")
+    # Check if employee exists
+    employee = db.query(Employee).filter(Employee.id == check_in_data.employee_id).first()
+    if not employee:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Employee not found"
+        )
     
-    return handle_service_error(db, services.check_out, db, current_user["employee_id"], data)
-
-
-@router.get("/my-attendance", response_model=List[AttendanceOut])
-def get_my_attendance(
-    start_date: date = Query(...),
-    end_date: date = Query(...),
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(require_roles("employee", "admin", "hr"))
-):
-    """Get current user's attendance within date range"""
-    if not current_user.get("employee_id"):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="User is not an employee")
+    # Get attendance settings
+    settings = db.query(models.AttendanceSetting).first()
+    if not settings:
+        settings = models.AttendanceSetting()
+        db.add(settings)
+        db.commit()
     
-    date_range = DateRange(start_date=start_date, end_date=end_date)
-    return services.get_employee_attendance(db, current_user["employee_id"], date_range)
-
-
-@router.get("/my-summary", response_model=AttendanceSummary)
-def get_my_attendance_summary(
-    year: int = Query(...),
-    month: int = Query(..., ge=1, le=12),
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(require_roles("employee", "admin", "hr"))
-):
-    """Get current user's attendance summary"""
-    if not current_user.get("employee_id"):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="User is not an employee")
+    # Get current date
+    current_date = check_in_data.date or datetime.utcnow()
+    today = current_date.replace(hour=0, minute=0, second=0, microsecond=0)
     
-    try:
-        return services.get_attendance_summary(db, current_user["employee_id"], year, month)
-    except services.NotFoundError as e:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
-
-
-# Admin/HR only attendance endpoints
-@router.post("/attendances", response_model=AttendanceOut, status_code=status.HTTP_201_CREATED)
-def create_attendance(
-    data: AttendanceCreate,
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(require_roles("admin", "hr"))
-):
-    """Create attendance record manually (Admin/HR only)"""
-    return handle_service_error(db, services.create_attendance, db, data)
-
-
-@router.get("/attendances/{attendance_id}", response_model=AttendanceDetailOut)
-def get_attendance(
-    attendance_id: int,
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(require_roles("admin", "hr", "manager"))
-):
-    """Get attendance by ID (Admin/HR/Manager only)"""
-    attendance = services.get_attendance_by_id(db, attendance_id)
-    if not attendance:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Attendance not found")
+    # Check if already checked in today
+    existing_attendance = db.query(models.Attendance).filter(
+        and_(
+            models.Attendance.employee_id == check_in_data.employee_id,
+            models.Attendance.date >= today,
+            models.Attendance.date < today + timedelta(days=1)
+        )
+    ).first()
+    
+    if existing_attendance:
+        if existing_attendance.check_in_time:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Already checked in today"
+            )
+    
+    # Create attendance record
+    attendance = models.Attendance(
+        employee_id=check_in_data.employee_id,
+        date=current_date,
+        check_in_time=current_date,
+        check_in_ip=check_in_data.check_in_ip,
+        check_in_device=check_in_data.check_in_device,
+        check_in_location=check_in_data.check_in_location,
+        remarks=check_in_data.remarks
+    )
+    
+    # Determine status based on check-in time
+    check_in_time = current_date.time()
+    if check_in_time > settings.office_start_time:
+        late_minutes = (datetime.combine(date.today(), check_in_time) - 
+                       datetime.combine(date.today(), settings.office_start_time)).total_seconds() / 60
+        if late_minutes > settings.late_threshold_minutes:
+            attendance.status = "late"
+    
+    db.add(attendance)
+    db.commit()
+    db.refresh(attendance)
+    
     return attendance
 
-
-@router.get("/employees/{employee_id}/attendances", response_model=List[AttendanceOut])
-def get_employee_attendance(
-    employee_id: int,
-    start_date: date = Query(...),
-    end_date: date = Query(...),
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(require_roles("admin", "hr", "manager"))
+@router.put("/check-out", response_model=schemas.AttendanceResponse)
+def check_out(
+    check_out_data: schemas.CheckOutRequest,
+    db: Session = Depends(get_db)
 ):
-    """Get attendance for a specific employee within date range (Admin/HR/Manager only)"""
-    date_range = DateRange(start_date=start_date, end_date=end_date)
-    return services.get_employee_attendance(db, employee_id, date_range)
+    """Employee check-out"""
+    
+    # Check if employee exists
+    employee = db.query(Employee).filter(Employee.id == check_out_data.employee_id).first()
+    if not employee:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Employee not found"
+        )
+    
+    # Get current date
+    current_date = check_out_data.date or datetime.utcnow()
+    today = current_date.replace(hour=0, minute=0, second=0, microsecond=0)
+    
+    # Get today's attendance record
+    attendance = db.query(models.Attendance).filter(
+        and_(
+            models.Attendance.employee_id == check_out_data.employee_id,
+            models.Attendance.date >= today,
+            models.Attendance.date < today + timedelta(days=1)
+        )
+    ).first()
+    
+    if not attendance:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No check-in record found for today"
+        )
+    
+    if attendance.check_out_time:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Already checked out"
+        )
+    
+    # Update check-out time
+    attendance.check_out_time = current_date
+    attendance.check_out_ip = check_out_data.check_out_ip
+    attendance.check_out_device = check_out_data.check_out_device
+    attendance.check_out_location = check_out_data.check_out_location
+    if check_out_data.remarks:
+        attendance.remarks = check_out_data.remarks
+    
+    # Calculate working hours
+    if attendance.check_in_time:
+        duration = attendance.check_out_time - attendance.check_in_time
+        hours = duration.total_seconds() // 3600
+        minutes = (duration.total_seconds() % 3600) // 60
+        attendance.working_hours = f"{int(hours):02d}:{int(minutes):02d}:00"
+        
+        # Update status based on working hours
+        settings = db.query(models.AttendanceSetting).first()
+        if settings and hours < settings.half_day_threshold_hours:
+            attendance.status = "half-day"
+    
+    db.commit()
+    db.refresh(attendance)
+    
+    return attendance
 
+@router.get("/today/{employee_id}", response_model=schemas.AttendanceResponse)
+def get_today_attendance(
+    employee_id: int,
+    db: Session = Depends(get_db)
+):
+    """Get today's attendance for an employee"""
+    
+    today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    
+    attendance = db.query(models.Attendance).filter(
+        and_(
+            models.Attendance.employee_id == employee_id,
+            models.Attendance.date >= today,
+            models.Attendance.date < today + timedelta(days=1)
+        )
+    ).first()
+    
+    if not attendance:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No attendance record found for today"
+        )
+    
+    return attendance
 
-@router.get("/attendances", response_model=List[AttendanceDetailOut])
-def get_all_attendances(
+# ==================== Attendance Records Routes ====================
+@router.get("/records", response_model=List[schemas.AttendanceDetailResponse])
+def get_attendance_records(
+    employee_id: Optional[int] = Query(None),
+    department_id: Optional[int] = Query(None),
+    start_date: Optional[datetime] = Query(None),
+    end_date: Optional[datetime] = Query(None),
+    status: Optional[str] = Query(None),
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=1000),
-    employee_id: Optional[int] = Query(None),
-    start_date: Optional[date] = Query(None),
-    end_date: Optional[date] = Query(None),
-    status: Optional[AttendanceStatus] = Query(None),
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(require_roles("admin", "hr"))
+    db: Session = Depends(get_db)
 ):
-    """Get all attendance records with filters (Admin/HR only)"""
-    return services.get_all_attendance(
-        db, skip, limit, employee_id, start_date, end_date, status
+    """Get attendance records with filters"""
+    
+    query = db.query(models.Attendance)
+    
+    # Apply filters
+    if employee_id:
+        query = query.filter(models.Attendance.employee_id == employee_id)
+    
+    if department_id:
+        query = query.join(Employee).filter(Employee.department_id == department_id)
+    
+    if start_date:
+        query = query.filter(models.Attendance.date >= start_date)
+    
+    if end_date:
+        query = query.filter(models.Attendance.date <= end_date)
+    
+    if status:
+        query = query.filter(models.Attendance.status == status)
+    
+    # Order by date descending
+    query = query.order_by(desc(models.Attendance.date))
+    
+    records = query.offset(skip).limit(limit).all()
+    
+    # Add employee details
+    result = []
+    for record in records:
+        record_data = schemas.AttendanceDetailResponse.model_validate(record)
+        if record.employee:
+            record_data.employee_name = record.employee.full_name
+            record_data.employee_code = record.employee.employee_code
+            if record.employee.department:
+                record_data.department = record.employee.department.name
+        result.append(record_data)
+    
+    return result
+
+@router.get("/records/{record_id}", response_model=schemas.AttendanceDetailResponse)
+def get_attendance_record(
+    record_id: int,
+    db: Session = Depends(get_db)
+):
+    """Get attendance record by ID"""
+    
+    record = db.query(models.Attendance).filter(models.Attendance.id == record_id).first()
+    
+    if not record:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Attendance record not found"
+        )
+    
+    record_data = schemas.AttendanceDetailResponse.model_validate(record)
+    if record.employee:
+        record_data.employee_name = record.employee.full_name
+        record_data.employee_code = record.employee.employee_code
+        if record.employee.department:
+            record_data.department = record.employee.department.name
+    
+    return record_data
+
+@router.put("/records/{record_id}", response_model=schemas.AttendanceResponse)
+def update_attendance_record(
+    record_id: int,
+    record_in: schemas.AttendanceUpdate,
+    db: Session = Depends(get_db)
+):
+    """Update attendance record (admin only)"""
+    
+    record = db.query(models.Attendance).filter(models.Attendance.id == record_id).first()
+    
+    if not record:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Attendance record not found"
+        )
+    
+    # Update fields
+    update_data = record_in.model_dump(exclude_unset=True)
+    for field, value in update_data.items():
+        setattr(record, field, value)
+    
+    # Recalculate working hours if both check-in and check-out are present
+    if record.check_in_time and record.check_out_time:
+        duration = record.check_out_time - record.check_in_time
+        hours = duration.total_seconds() // 3600
+        minutes = (duration.total_seconds() % 3600) // 60
+        record.working_hours = f"{int(hours):02d}:{int(minutes):02d}:00"
+    
+    db.commit()
+    db.refresh(record)
+    
+    return record
+
+@router.delete("/records/{record_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_attendance_record(
+    record_id: int,
+    db: Session = Depends(get_db)
+):
+    """Delete attendance record (admin only)"""
+    
+    record = db.query(models.Attendance).filter(models.Attendance.id == record_id).first()
+    
+    if not record:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Attendance record not found"
+        )
+    
+    db.delete(record)
+    db.commit()
+    
+    return None
+
+# ==================== Attendance Settings Routes ====================
+@router.get("/settings", response_model=schemas.AttendanceSettingResponse)
+def get_attendance_settings(
+    db: Session = Depends(get_db)
+):
+    """Get attendance settings"""
+    
+    settings = db.query(models.AttendanceSetting).first()
+    
+    if not settings:
+        # Create default settings
+        settings = models.AttendanceSetting()
+        db.add(settings)
+        db.commit()
+        db.refresh(settings)
+    
+    return settings
+
+@router.put("/settings", response_model=schemas.AttendanceSettingResponse)
+def update_attendance_settings(
+    settings_in: schemas.AttendanceSettingUpdate,
+    db: Session = Depends(get_db)
+):
+    """Update attendance settings"""
+    
+    settings = db.query(models.AttendanceSetting).first()
+    
+    if not settings:
+        settings = models.AttendanceSetting()
+        db.add(settings)
+    
+    # Update fields
+    update_data = settings_in.model_dump(exclude_unset=True)
+    for field, value in update_data.items():
+        setattr(settings, field, value)
+    
+    db.commit()
+    db.refresh(settings)
+    
+    return settings
+
+# ==================== Statistics Routes ====================
+@router.get("/statistics/daily")
+def get_daily_statistics(
+    date: Optional[datetime] = Query(None),
+    department_id: Optional[int] = Query(None),
+    db: Session = Depends(get_db)
+):
+    """Get daily attendance statistics"""
+    
+    target_date = date or datetime.utcnow()
+    start_of_day = target_date.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_of_day = start_of_day + timedelta(days=1)
+    
+    # Get employees
+    query = db.query(Employee)
+    if department_id:
+        query = query.filter(Employee.department_id == department_id)
+    
+    total_employees = query.count()
+    
+    # Get attendance records for the day
+    attendance_query = db.query(models.Attendance).filter(
+        and_(
+            models.Attendance.date >= start_of_day,
+            models.Attendance.date < end_of_day
+        )
     )
+    
+    if department_id:
+        attendance_query = attendance_query.join(Employee).filter(Employee.department_id == department_id)
+    
+    records = attendance_query.all()
+    
+    present = len(records)
+    late = len([r for r in records if r.status == "late"])
+    half_day = len([r for r in records if r.status == "half-day"])
+    absent = total_employees - present
+    
+    attendance_percentage = (present / total_employees * 100) if total_employees > 0 else 0
+    
+    return {
+        "date": start_of_day,
+        "total_employees": total_employees,
+        "present": present,
+        "absent": absent,
+        "late": late,
+        "half_day": half_day,
+        "attendance_percentage": round(attendance_percentage, 2)
+    }
 
-
-@router.put("/attendances/{attendance_id}", response_model=AttendanceOut)
-def update_attendance(
-    attendance_id: int,
-    updates: AttendanceUpdate,
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(require_roles("admin", "hr"))
-):
-    """Update attendance record (Admin/HR only)"""
-    return handle_service_error(db, services.update_attendance, db, attendance_id, updates)
-
-
-@router.delete("/attendances/{attendance_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_attendance(
-    attendance_id: int,
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(require_roles("admin"))
-):
-    """Delete attendance record (Admin only)"""
-    handle_service_error(db, services.delete_attendance, db, attendance_id)
-    return None
-
-
-@router.get("/employees/{employee_id}/summary", response_model=AttendanceSummary)
-def get_attendance_summary(
+@router.get("/statistics/employee/{employee_id}")
+def get_employee_statistics(
     employee_id: int,
-    year: int = Query(...),
-    month: int = Query(..., ge=1, le=12),
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(require_roles("admin", "hr", "manager"))
+    start_date: Optional[datetime] = Query(None),
+    end_date: Optional[datetime] = Query(None),
+    db: Session = Depends(get_db)
 ):
-    """Get attendance summary for an employee (Admin/HR/Manager only)"""
-    try:
-        return services.get_attendance_summary(db, employee_id, year, month)
-    except services.NotFoundError as e:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
-
-
-# Leave Request Endpoints (Employee accessible)
-@router.post("/leaves", response_model=LeaveRequestOut, status_code=status.HTTP_201_CREATED)
-def create_leave_request(
-    data: LeaveRequestCreate,
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(require_roles("employee", "admin", "hr"))
-):
-    """Create a new leave request"""
-    # Set employee_id from current user if not provided
-    if not data.employee_id and current_user.get("employee_id"):
-        data.employee_id = current_user["employee_id"]
+    """Get attendance statistics for an employee"""
     
-    return handle_service_error(db, services.create_leave_request, db, data)
-
-
-@router.get("/my-leaves", response_model=List[LeaveRequestOut])
-def get_my_leaves(
-    status: Optional[LeaveStatus] = Query(None),
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(require_roles("employee", "admin", "hr"))
-):
-    """Get current user's leave requests"""
-    if not current_user.get("employee_id"):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="User is not an employee")
+    # Check if employee exists
+    employee = db.query(Employee).filter(Employee.id == employee_id).first()
+    if not employee:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Employee not found"
+        )
     
-    return services.get_employee_leave_requests(db, current_user["employee_id"], status)
-
-
-@router.get("/my-leave-balance", response_model=LeaveBalance)
-def get_my_leave_balance(
-    year: int = Query(default=date.today().year),
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(require_roles("employee", "admin", "hr"))
-):
-    """Get current user's leave balance"""
-    if not current_user.get("employee_id"):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="User is not an employee")
+    # Set date range
+    if not start_date:
+        start_date = datetime.utcnow().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     
-    try:
-        return services.get_leave_balance(db, current_user["employee_id"], year)
-    except services.NotFoundError as e:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    if not end_date:
+        end_date = datetime.utcnow()
+    
+    # Get attendance records
+    records = db.query(models.Attendance).filter(
+        and_(
+            models.Attendance.employee_id == employee_id,
+            models.Attendance.date >= start_date,
+            models.Attendance.date <= end_date
+        )
+    ).all()
+    
+    total_days = (end_date - start_date).days + 1
+    present_days = len(records)
+    late_days = len([r for r in records if r.status == "late"])
+    half_days = len([r for r in records if r.status == "half-day"])
+    absent_days = total_days - present_days
+    
+    attendance_percentage = (present_days / total_days * 100) if total_days > 0 else 0
+    
+    return {
+        "employee_id": employee_id,
+        "employee_name": employee.full_name,
+        "employee_code": employee.employee_code,
+        "start_date": start_date,
+        "end_date": end_date,
+        "total_days": total_days,
+        "present_days": present_days,
+        "absent_days": absent_days,
+        "late_days": late_days,
+        "half_days": half_days,
+        "attendance_percentage": round(attendance_percentage, 2),
+        "records": records
+    }
 
-
-# Admin/HR/Manager leave endpoints
-@router.get("/leaves/{leave_id}", response_model=LeaveRequestOut)
-def get_leave_request(
-    leave_id: int,
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(require_roles("admin", "hr", "manager"))
+@router.get("/statistics/monthly")
+def get_monthly_statistics(
+    year: int = Query(default=datetime.utcnow().year),
+    month: int = Query(default=datetime.utcnow().month),
+    department_id: Optional[int] = Query(None),
+    db: Session = Depends(get_db)
 ):
-    """Get leave request by ID (Admin/HR/Manager only)"""
-    leave = services.get_leave_request(db, leave_id)
-    if not leave:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Leave request not found")
-    return leave
+    """Get monthly attendance statistics"""
+    
+    start_date = datetime(year, month, 1)
+    if month == 12:
+        end_date = datetime(year + 1, 1, 1) - timedelta(days=1)
+    else:
+        end_date = datetime(year, month + 1, 1) - timedelta(days=1)
+    
+    # Get employees
+    query = db.query(Employee)
+    if department_id:
+        query = query.filter(Employee.department_id == department_id)
+    
+    employees = query.all()
+    
+    monthly_stats = []
+    for employee in employees:
+        records = db.query(models.Attendance).filter(
+            and_(
+                models.Attendance.employee_id == employee.id,
+                models.Attendance.date >= start_date,
+                models.Attendance.date <= end_date
+            )
+        ).all()
+        
+        total_days = (end_date - start_date).days + 1
+        present_days = len(records)
+        
+        monthly_stats.append({
+            "employee_id": employee.id,
+            "employee_name": employee.full_name,
+            "employee_code": employee.employee_code,
+            "present_days": present_days,
+            "absent_days": total_days - present_days,
+            "attendance_percentage": round((present_days / total_days * 100), 2) if total_days > 0 else 0
+        })
+    
+    return {
+        "year": year,
+        "month": month,
+        "start_date": start_date,
+        "end_date": end_date,
+        "total_employees": len(employees),
+        "monthly_stats": monthly_stats
+    }
 
-
-@router.get("/employees/{employee_id}/leaves", response_model=List[LeaveRequestOut])
-def get_employee_leaves(
-    employee_id: int,
-    status: Optional[LeaveStatus] = Query(None),
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(require_roles("admin", "hr", "manager"))
+# ==================== Bulk Import Routes ====================
+@router.post("/import/csv", response_model=schemas.AttendanceImportResponse)
+async def import_attendance_csv(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db)
 ):
-    """Get leave requests for an employee (Admin/HR/Manager only)"""
-    return services.get_employee_leave_requests(db, employee_id, status)
-
-
-@router.get("/leaves/pending", response_model=List[LeaveRequestOut])
-def get_pending_leaves(
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(require_roles("admin", "hr", "manager"))
-):
-    """Get all pending leave requests (Admin/HR/Manager only)"""
-    return services.get_pending_leave_requests(db)
-
-
-@router.put("/leaves/{leave_id}/approve", response_model=LeaveRequestOut)
-def approve_leave(
-    leave_id: int,
-    decision: LeaveRequestApprove,
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(require_roles("admin", "hr", "manager"))
-):
-    """Approve or reject a leave request (Admin/HR/Manager only)"""
-    return handle_service_error(
-        db, services.approve_leave_request, db, leave_id, current_user["id"], decision
+    """Import attendance records from CSV file"""
+    
+    if not file.filename.endswith('.csv'):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only CSV files are allowed"
+        )
+    
+    # Create import record
+    import_record = models.AttendanceImport(
+        file_name=file.filename,
+        file_path=f"uploads/{file.filename}",
+        created_by=current_user.id,
+        status="processing"
     )
-
-
-@router.put("/leaves/{leave_id}", response_model=LeaveRequestOut)
-def update_leave_request(
-    leave_id: int,
-    updates: LeaveRequestUpdate,
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(require_roles("admin", "hr"))
-):
-    """Update leave request (Admin/HR only)"""
-    return handle_service_error(db, services.update_leave_request, db, leave_id, updates)
-
-
-@router.delete("/leaves/{leave_id}", status_code=status.HTTP_204_NO_CONTENT)
-def cancel_leave_request(
-    leave_id: int,
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(require_roles("admin", "hr"))
-):
-    """Cancel leave request (Admin/HR only)"""
-    handle_service_error(db, services.cancel_leave_request, db, leave_id)
-    return None
-
-
-@router.get("/employees/{employee_id}/leave-balance", response_model=LeaveBalance)
-def get_leave_balance(
-    employee_id: int,
-    year: int = Query(default=date.today().year),
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(require_roles("admin", "hr", "manager"))
-):
-    """Get leave balance for an employee (Admin/HR/Manager only)"""
+    db.add(import_record)
+    db.commit()
+    db.refresh(import_record)
+    
     try:
-        return services.get_leave_balance(db, employee_id, year)
-    except services.NotFoundError as e:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+        # Read CSV content
+        content = await file.read()
+        csv_data = content.decode('utf-8')
+        csv_reader = csv.DictReader(io.StringIO(csv_data))
+        
+        successful = 0
+        failed = 0
+        errors = []
+        
+        for row_num, row in enumerate(csv_reader, start=2):
+            try:
+                # Extract data from CSV
+                employee_code = row.get('employee_code')
+                date_str = row.get('date')
+                check_in_str = row.get('check_in_time')
+                check_out_str = row.get('check_out_time')
+                
+                # Find employee
+                employee = db.query(Employee).filter(Employee.employee_code == employee_code).first()
+                if not employee:
+                    errors.append(f"Row {row_num}: Employee {employee_code} not found")
+                    failed += 1
+                    continue
+                
+                # Parse date and times
+                date = parser.parse(date_str) if date_str else None
+                check_in_time = parser.parse(check_in_str) if check_in_str else None
+                check_out_time = parser.parse(check_out_str) if check_out_str else None
+                
+                if not date:
+                    errors.append(f"Row {row_num}: Date is required")
+                    failed += 1
+                    continue
+                
+                # Create attendance record
+                attendance = models.Attendance(
+                    employee_id=employee.id,
+                    date=date,
+                    check_in_time=check_in_time,
+                    check_out_time=check_out_time,
+                    status=row.get('status', 'present'),
+                    remarks=row.get('remarks')
+                )
+                
+                # Calculate working hours if both times present
+                if check_in_time and check_out_time:
+                    duration = check_out_time - check_in_time
+                    hours = duration.total_seconds() // 3600
+                    minutes = (duration.total_seconds() % 3600) // 60
+                    attendance.working_hours = f"{int(hours):02d}:{int(minutes):02d}:00"
+                
+                db.add(attendance)
+                successful += 1
+                
+            except Exception as e:
+                errors.append(f"Row {row_num}: {str(e)}")
+                failed += 1
+        
+        # Commit all records
+        db.commit()
+        
+        # Update import record
+        import_record.total_records = successful + failed
+        import_record.successful_records = successful
+        import_record.failed_records = failed
+        import_record.status = "completed"
+        import_record.error_log = "\n".join(errors) if errors else None
+        db.commit()
+        
+        return schemas.AttendanceImportResponse(
+            import_id=import_record.id,
+            status="completed",
+            total_records=import_record.total_records,
+            successful_records=successful,
+            failed_records=failed,
+            error_log=import_record.error_log
+        )
+        
+    except Exception as e:
+        import_record.status = "failed"
+        import_record.error_log = str(e)
+        db.commit()
+        
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Import failed: {str(e)}"
+        )
 
-
-# Holiday Endpoints (Admin/HR only)
-@router.post("/holidays", response_model=HolidayOut, status_code=status.HTTP_201_CREATED)
-def create_holiday(
-    data: HolidayCreate,
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(require_roles("admin", "hr"))
+# ==================== Export Routes ====================
+@router.get("/export")
+def export_attendance(
+    start_date: Optional[datetime] = Query(None),
+    end_date: Optional[datetime] = Query(None),
+    department_id: Optional[int] = Query(None),
+    format: str = Query("json", regex="^(json|csv)$"),
+    db: Session = Depends(get_db)
 ):
-    """Create a new holiday (Admin/HR only)"""
-    return handle_service_error(db, services.create_holiday, db, data)
-
-
-@router.get("/holidays/{holiday_id}", response_model=HolidayOut)
-def get_holiday(
-    holiday_id: int,
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(require_roles("admin", "hr", "employee"))
-):
-    """Get holiday by ID (All authenticated users)"""
-    holiday = services.get_holiday(db, holiday_id)
-    if not holiday:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Holiday not found")
-    return holiday
-
-
-@router.get("/holidays", response_model=List[HolidayOut])
-def get_holidays(
-    year: int = Query(default=date.today().year),
-    location: Optional[str] = Query(None),
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(require_roles("admin", "hr", "employee"))
-):
-    """Get all holidays for a specific year (All authenticated users)"""
-    return services.get_holidays_by_year(db, year, location)
-
-
-@router.put("/holidays/{holiday_id}", response_model=HolidayOut)
-def update_holiday(
-    holiday_id: int,
-    updates: HolidayUpdate,
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(require_roles("admin", "hr"))
-):
-    """Update holiday (Admin/HR only)"""
-    return handle_service_error(db, services.update_holiday, db, holiday_id, updates)
-
-
-@router.delete("/holidays/{holiday_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_holiday(
-    holiday_id: int,
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(require_roles("admin"))
-):
-    """Delete holiday (Admin only)"""
-    handle_service_error(db, services.delete_holiday, db, holiday_id)
-    return None
-
-
-# Work Shift Endpoints (Admin/HR only)
-@router.post("/shifts", response_model=WorkShiftOut, status_code=status.HTTP_201_CREATED)
-def create_work_shift(
-    data: WorkShiftCreate,
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(require_roles("admin", "hr"))
-):
-    """Create a new work shift (Admin/HR only)"""
-    return handle_service_error(db, services.create_work_shift, db, data)
-
-
-@router.get("/shifts/{shift_id}", response_model=WorkShiftOut)
-def get_work_shift(
-    shift_id: int,
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(require_roles("admin", "hr", "employee"))
-):
-    """Get work shift by ID (All authenticated users)"""
-    shift = services.get_work_shift(db, shift_id)
-    if not shift:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Work shift not found")
-    return shift
-
-
-@router.get("/shifts", response_model=List[WorkShiftOut])
-def get_all_work_shifts(
-    active_only: bool = Query(True),
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(require_roles("admin", "hr", "employee"))
-):
-    """Get all work shifts (All authenticated users)"""
-    return services.get_all_work_shifts(db, active_only)
-
-
-@router.put("/shifts/{shift_id}", response_model=WorkShiftOut)
-def update_work_shift(
-    shift_id: int,
-    updates: WorkShiftUpdate,
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(require_roles("admin", "hr"))
-):
-    """Update work shift (Admin/HR only)"""
-    return handle_service_error(db, services.update_work_shift, db, shift_id, updates)
-
-
-@router.delete("/shifts/{shift_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_work_shift(
-    shift_id: int,
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(require_roles("admin"))
-):
-    """Delete work shift (Admin only)"""
-    handle_service_error(db, services.delete_work_shift, db, shift_id)
-    return None
-
-
-# Employee Shift Assignment Endpoints (Admin/HR only)
-@router.post("/employee-shifts", response_model=EmployeeShiftOut)
-def assign_shift_to_employee(
-    data: EmployeeShiftAssign,
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(require_roles("admin", "hr"))
-):
-    """Assign a shift to an employee (Admin/HR only)"""
-    return handle_service_error(db, services.assign_shift_to_employee, db, data)
-
-
-@router.get("/employees/{employee_id}/current-shift", response_model=Optional[EmployeeShiftOut])
-def get_employee_current_shift(
-    employee_id: int,
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(require_roles("admin", "hr", "manager"))
-):
-    """Get current shift assignment for an employee (Admin/HR/Manager only)"""
-    return services.get_employee_current_shift(db, employee_id)
-
-
-@router.get("/employees/{employee_id}/shift-history", response_model=List[EmployeeShiftOut])
-def get_employee_shift_history(
-    employee_id: int,
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(require_roles("admin", "hr", "manager"))
-):
-    """Get shift assignment history for an employee (Admin/HR/Manager only)"""
-    return services.get_employee_shift_history(db, employee_id)
-
-
-@router.get("/my-current-shift", response_model=Optional[EmployeeShiftOut])
-def get_my_current_shift(
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(require_roles("employee", "admin", "hr"))
-):
-    """Get current user's shift assignment"""
-    if not current_user.get("employee_id"):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="User is not an employee")
+    """Export attendance records"""
     
-    return services.get_employee_current_shift(db, current_user["employee_id"])
-
-
-@router.get("/my-shift-history", response_model=List[EmployeeShiftOut])
-def get_my_shift_history(
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(require_roles("employee", "admin", "hr"))
-):
-    """Get current user's shift assignment history"""
-    if not current_user.get("employee_id"):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="User is not an employee")
+    query = db.query(models.Attendance)
     
-    return services.get_employee_shift_history(db, current_user["employee_id"])
-
-
-@router.put("/employee-shifts/{assignment_id}/end", response_model=EmployeeShiftOut)
-def end_shift_assignment(
-    assignment_id: int,
-    end_date: date = Query(...),
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(require_roles("admin", "hr"))
-):
-    """End a shift assignment (Admin/HR only)"""
-    return handle_service_error(db, services.end_shift_assignment, db, assignment_id, end_date)
+    if start_date:
+        query = query.filter(models.Attendance.date >= start_date)
+    
+    if end_date:
+        query = query.filter(models.Attendance.date <= end_date)
+    
+    if department_id:
+        query = query.join(Employee).filter(Employee.department_id == department_id)
+    
+    records = query.all()
+    
+    export_data = []
+    for record in records:
+        export_data.append({
+            "employee_code": record.employee.employee_code if record.employee else None,
+            "employee_name": record.employee.full_name if record.employee else None,
+            "department": record.employee.department.name if record.employee and record.employee.department else None,
+            "date": record.date,
+            "check_in_time": record.check_in_time,
+            "check_out_time": record.check_out_time,
+            "working_hours": record.working_hours,
+            "status": record.status,
+            "remarks": record.remarks
+        })
+    
+    if format == "csv":
+        import csv
+        from fastapi.responses import StreamingResponse
+        
+        output = io.StringIO()
+        if export_data:
+            writer = csv.DictWriter(output, fieldnames=export_data[0].keys())
+            writer.writeheader()
+            writer.writerows(export_data)
+        
+        output.seek(0)
+        return StreamingResponse(
+            iter([output.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=attendance_export.csv"}
+        )
+    
+    return export_data

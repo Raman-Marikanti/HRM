@@ -180,10 +180,15 @@ class EmployeeUpdate(BaseModel):
     employee_document_detail: Optional[EmployeeDocumentDetailUpdate] = None
     employee_profile: Optional[EmployeeProfileUpdate] = None
 
-
+class ManagerResponse(BaseModel):
+    id: int
+    full_name: Optional[str] = None
+    
+    class Config:
+        from_attributes = True
 
 class EmployeeResponse(EmployeeBase):
-    id: int
+    id: int 
     user_id: int
     created_at: datetime
     updated_at: datetime
@@ -193,7 +198,7 @@ class EmployeeResponse(EmployeeBase):
     user: Optional[UserOut] = None
     department: Optional[DepartmentResponse] = None
     designation: Optional[DesignationResponse] = None
-    manager: Optional['EmployeeResponse'] = None
+    manager: Optional[ManagerResponse] = None
     bank_detail: Optional[BankDetailResponse] = None
     employee_personal_detail: Optional[EmployeePersonalDetailResponse] = None
     employee_document_detail: Optional[EmployeeDocumentDetailResponse] = None

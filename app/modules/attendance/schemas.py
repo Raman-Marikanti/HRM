@@ -1,266 +1,111 @@
-from pydantic import BaseModel, Field, ConfigDict, validator
+# app/modules/attendance/schemas.py
+from datetime import datetime, time
 from typing import Optional, List
-from datetime import date, datetime, time
-from enum import Enum
-
-from app.modules.attendance.models import AttendanceStatus, LeaveType, LeaveStatus
-
-
-# Base schemas with ORM mode
-class BaseSchema(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
+from pydantic import BaseModel, Field, validator, field_validator
 
 # Attendance Schemas
-class AttendanceBase(BaseSchema):
-    date: date
+class AttendanceBase(BaseModel):
+    date: datetime
     check_in_time: Optional[datetime] = None
     check_out_time: Optional[datetime] = None
-    status: AttendanceStatus = AttendanceStatus.PRESENT
-    work_description: Optional[str] = Field(None, max_length=1000)
-    
-    # Location
-    check_in_latitude: Optional[float] = None
-    check_in_longitude: Optional[float] = None
-    check_out_latitude: Optional[float] = None
-    check_out_longitude: Optional[float] = None
+    check_in_ip: Optional[str] = Field(None, max_length=45)
+    check_out_ip: Optional[str] = Field(None, max_length=45)
+    check_in_device: Optional[str] = Field(None, max_length=255)
+    check_out_device: Optional[str] = Field(None, max_length=255)
+    check_in_location: Optional[str] = Field(None, max_length=255)
+    check_out_location: Optional[str] = Field(None, max_length=255)
+    remarks: Optional[str] = None
 
+class CheckInRequest(BaseModel):
+    employee_id: int
+    check_in_ip: Optional[str] = Field(None, max_length=45)
+    check_in_device: Optional[str] = Field(None, max_length=255)
+    check_in_location: Optional[str] = Field(None, max_length=255)
+    date: Optional[datetime] = None  # For manual check-in, defaults to current time
+    remarks: Optional[str] = None
+
+class CheckOutRequest(BaseModel):
+    employee_id: int
+    check_out_ip: Optional[str] = Field(None, max_length=45)
+    check_out_device: Optional[str] = Field(None, max_length=255)
+    check_out_location: Optional[str] = Field(None, max_length=255)
+    date: Optional[datetime] = None  # For manual check-out, defaults to current time
+    remarks: Optional[str] = None
 
 class AttendanceCreate(AttendanceBase):
     employee_id: int
+    status: Optional[str] = "present"
 
-
-class AttendanceCheckIn(BaseModel):
-    latitude: Optional[float] = None
-    longitude: Optional[float] = None
-    device_info: Optional[str] = Field(None, max_length=255)
-    work_description: Optional[str] = Field(None, max_length=1000)
-
-
-class AttendanceCheckOut(BaseModel):
-    latitude: Optional[float] = None
-    longitude: Optional[float] = None
-    device_info: Optional[str] = Field(None, max_length=255)
-    work_description: Optional[str] = Field(None, max_length=1000)
-
-
-class AttendanceUpdate(BaseSchema):
-    check_in_time: Optional[datetime] = None
+class AttendanceUpdate(BaseModel):
     check_out_time: Optional[datetime] = None
-    status: Optional[AttendanceStatus] = None
-    work_description: Optional[str] = Field(None, max_length=1000)
-    overtime_hours: Optional[float] = Field(None, ge=0)
-    late_minutes: Optional[int] = Field(None, ge=0)
-    early_exit_minutes: Optional[int] = Field(None, ge=0)
-
-
-class AttendanceOut(AttendanceBase):
-    id: int
-    employee_id: int
-    employee_name: Optional[str] = None
-    employee_code: Optional[str] = None
-    overtime_hours: float
-    late_minutes: int
-    early_exit_minutes: int
-    created_at: datetime
-    updated_at: datetime
-    
-    @validator('employee_name', always=True)
-    def get_employee_name(cls, v, values):
-        if 'employee' in values:
-            employee = values['employee']
-            if employee and hasattr(employee, 'user'):
-                return f"{employee.user.first_name} {employee.user.last_name}"
-        return v
-
-
-class AttendanceDetailOut(AttendanceOut):
     check_in_ip: Optional[str] = None
     check_out_ip: Optional[str] = None
     check_in_device: Optional[str] = None
     check_out_device: Optional[str] = None
-    created_by: Optional[int] = None
-    updated_by: Optional[int] = None
+    check_in_location: Optional[str] = None
+    check_out_location: Optional[str] = None
+    status: Optional[str] = None
+    remarks: Optional[str] = None
 
-
-class AttendanceSummary(BaseModel):
-    employee_id: int
-    employee_name: str
-    employee_code: str
-    total_present: int
-    total_absent: int
-    total_late: int
-    total_half_days: int
-    total_leaves: int
-    total_overtime_hours: float
-    total_working_days: int
-    attendance_percentage: float
-
-
-class DateRange(BaseModel):
-    start_date: date
-    end_date: date
-    
-    @validator('end_date')
-    def validate_dates(cls, v, values):
-        if 'start_date' in values and v < values['start_date']:
-            raise ValueError('End date must be after start date')
-        return v
-
-
-# Leave Request Schemas
-class LeaveRequestBase(BaseSchema):
-    leave_type: LeaveType
-    start_date: date
-    end_date: date
-    reason: str = Field(..., min_length=5, max_length=1000)
-    comments: Optional[str] = Field(None, max_length=500)
-
-
-class LeaveRequestCreate(LeaveRequestBase):
-    employee_id: int
-
-
-class LeaveRequestUpdate(BaseSchema):
-    leave_type: Optional[LeaveType] = None
-    start_date: Optional[date] = None
-    end_date: Optional[date] = None
-    reason: Optional[str] = Field(None, min_length=5, max_length=1000)
-    comments: Optional[str] = Field(None, max_length=500)
-
-
-class LeaveRequestApprove(BaseModel):
-    approved: bool
-    comments: Optional[str] = Field(None, max_length=500)
-    rejection_reason: Optional[str] = Field(None, max_length=500)
-
-
-class LeaveRequestOut(LeaveRequestBase):
+class AttendanceResponse(AttendanceBase):
     id: int
     employee_id: int
+    working_hours: Optional[str] = None
+    status: str
+    created_at: datetime
+    updated_at: datetime
+    
+    class Config:
+        from_attributes = True
+
+class AttendanceDetailResponse(AttendanceResponse):
     employee_name: Optional[str] = None
     employee_code: Optional[str] = None
-    status: LeaveStatus
-    total_days: float
-    rejection_reason: Optional[str] = None
-    approved_by: Optional[int] = None
-    approver_name: Optional[str] = None
-    approved_at: Optional[datetime] = None
-    attachment_path: Optional[str] = None
-    created_at: datetime
-    updated_at: datetime
+    department: Optional[str] = None
+    
+    class Config:
+        from_attributes = True
 
+# Attendance Setting Schemas
+class AttendanceSettingBase(BaseModel):
+    office_start_time: time = Field(default="09:00:00")
+    office_end_time: time = Field(default="18:00:00")
+    late_threshold_minutes: int = Field(default=15, ge=0, le=120)
+    half_day_threshold_hours: int = Field(default=4, ge=1, le=8)
+    allow_remote_checkin: bool = True
+    allow_multiple_checkins: bool = False
+    company_id: Optional[int] = None
 
-class LeaveBalance(BaseModel):
-    employee_id: int
-    employee_name: str
-    employee_code: str
-    casual_leave: float
-    sick_leave: float
-    earned_leave: float
-    maternity_leave: float
-    paternity_leave: float
-    comp_off: float
-    total_taken: float
-    total_remaining: float
-
-
-# Holiday Schemas
-class HolidayBase(BaseSchema):
-    name: str = Field(..., min_length=2, max_length=200)
-    date: date
-    is_recurring: bool = False
-    description: Optional[str] = Field(None, max_length=500)
-    location: Optional[str] = Field(None, max_length=100)
-    department_id: Optional[int] = None
-
-
-class HolidayCreate(HolidayBase):
+class AttendanceSettingCreate(AttendanceSettingBase):
     pass
 
+class AttendanceSettingUpdate(BaseModel):
+    office_start_time: Optional[time] = None
+    office_end_time: Optional[time] = None
+    late_threshold_minutes: Optional[int] = Field(None, ge=0, le=120)
+    half_day_threshold_hours: Optional[int] = Field(None, ge=1, le=8)
+    allow_remote_checkin: Optional[bool] = None
+    allow_multiple_checkins: Optional[bool] = None
 
-class HolidayUpdate(BaseSchema):
-    name: Optional[str] = Field(None, min_length=2, max_length=200)
-    date: Optional[date] = None
-    is_recurring: Optional[bool] = None
-    description: Optional[str] = Field(None, max_length=500)
-    location: Optional[str] = Field(None, max_length=100)
-    department_id: Optional[int] = None
-
-
-class HolidayOut(HolidayBase):
-    id: int
-    year: int
-    created_at: datetime
-    updated_at: datetime
-    department_name: Optional[str] = None
-
-
-# Work Shift Schemas
-class WorkShiftBase(BaseSchema):
-    name: str = Field(..., min_length=2, max_length=100)
-    start_time: time
-    end_time: time
-    break_start: Optional[time] = None
-    break_end: Optional[time] = None
-    grace_period_check_in: int = 15
-    grace_period_check_out: int = 15
-    total_working_hours: float
-    is_night_shift: bool = False
-    applicable_days: str = "1,2,3,4,5"
-    description: Optional[str] = Field(None, max_length=500)
-    is_active: bool = True
-
-
-class WorkShiftCreate(WorkShiftBase):
-    pass
-
-
-class WorkShiftUpdate(BaseSchema):
-    name: Optional[str] = Field(None, min_length=2, max_length=100)
-    start_time: Optional[time] = None
-    end_time: Optional[time] = None
-    break_start: Optional[time] = None
-    break_end: Optional[time] = None
-    grace_period_check_in: Optional[int] = Field(None, ge=0)
-    grace_period_check_out: Optional[int] = Field(None, ge=0)
-    total_working_hours: Optional[float] = Field(None, gt=0)
-    is_night_shift: Optional[bool] = None
-    applicable_days: Optional[str] = None
-    description: Optional[str] = Field(None, max_length=500)
-    is_active: Optional[bool] = None
-
-
-class WorkShiftOut(WorkShiftBase):
+class AttendanceSettingResponse(AttendanceSettingBase):
     id: int
     created_at: datetime
     updated_at: datetime
+    
+    class Config:
+        from_attributes = True
 
+# Attendance Statistics
+class DailyAttendanceStats(BaseModel):
+    date: datetime
+    total_employees: int
+    present: int
+    absent: int
+    late: int
+    half_day: int
+    attendance_percentage: float
 
-class EmployeeShiftAssign(BaseModel):
-    employee_id: int
-    shift_id: int
-    effective_from: date
-    effective_to: Optional[date] = None
-
-
-class EmployeeShiftOut(BaseSchema):
-    id: int
-    employee_id: int
-    employee_name: str
-    employee_code: str
-    shift_id: int
-    shift_name: str
-    effective_from: date
-    effective_to: Optional[date] = None
-    created_at: datetime
-    updated_at: datetime
-
-
-# Monthly Attendance Report
-class MonthlyAttendanceReport(BaseModel):
-    year: int
-    month: int
+class EmployeeAttendanceStats(BaseModel):
     employee_id: int
     employee_name: str
     employee_code: str
@@ -269,9 +114,27 @@ class MonthlyAttendanceReport(BaseModel):
     absent_days: int
     late_days: int
     half_days: int
-    leave_days: int
-    holidays: int
-    weekends: int
-    work_from_home_days: int
-    total_overtime_hours: float
-    attendance_details: List[AttendanceOut]
+    attendance_percentage: float
+
+# Bulk Import Schemas
+class AttendanceImportRequest(BaseModel):
+    file_name: str
+    file_content: str  # Base64 encoded file content
+
+class AttendanceImportResponse(BaseModel):
+    import_id: int
+    status: str
+    total_records: int
+    successful_records: int
+    failed_records: int
+    error_log: Optional[str] = None
+
+# Query Filters
+class AttendanceFilter(BaseModel):
+    employee_id: Optional[int] = None
+    start_date: Optional[datetime] = None
+    end_date: Optional[datetime] = None
+    status: Optional[str] = None
+    department_id: Optional[int] = None
+    is_checked_in: Optional[bool] = None
+    is_checked_out: Optional[bool] = None
