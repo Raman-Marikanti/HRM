@@ -10,14 +10,14 @@ from app.modules.admin.security import ACCESS_TOKEN_EXPIRE_MINUTES, create_acces
 
 from app.modules.admin import services as admin_services
 
-router = APIRouter(prefix="/employee/auth", tags=["Employee Management"])
+routers = APIRouter(prefix="/employee/auth", tags=["Employee Management"])
 
 
 # ============================================================================
 # OTP Authentication Endpoints
 # ============================================================================
 
-@router.post("/send-otp", response_model=OTPResponse)
+@routers.post("/send-otp", response_model=OTPResponse)
 def send_otp(
     otp_request: OTPRequest,
     db: Session = Depends(get_db)
@@ -44,7 +44,7 @@ def send_otp(
     )
 
 
-@router.post("/verify-otp", response_model=LoginResponse)
+@routers.post("/verify-otp", response_model=LoginResponse)
 def verify_otp_and_login(
     otp_verify: OTPVerify,
     request: Request,
@@ -86,7 +86,7 @@ def verify_otp_and_login(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
 
 
-@router.post("/logout")
+@routers.post("/logout")
 def logout():
     """Logout user (client should discard token)"""
     return {"message": "Successfully logged out"}
@@ -496,15 +496,15 @@ def read_employees(
     
     return employees
 
-@router.get("/employees/{employee_id}", response_model=schemas.EmployeeResponse)
+@router.get("/employees/{user_id}", response_model=schemas.EmployeeResponse)
 def read_employee(
-    employee_id: int,
+    user_id: int,
     db: Session = Depends(get_db),
 ):
     """Get employee by ID with all details"""
     
     employee = db.query(models.Employee).filter(
-        models.Employee.id == employee_id
+        models.Employee.user_id == user_id
     ).first()
     
     if not employee:
@@ -534,16 +534,16 @@ def read_employee_by_code(
     
     return employee
 
-@router.put("/employees/{employee_id}", response_model=schemas.EmployeeResponse)
+@router.put("/employees/{user_id}", response_model=schemas.EmployeeResponse)
 def update_employee(
-    employee_id: int,
+    user_id: int,
     employee_in: schemas.EmployeeUpdate,
     db: Session = Depends(get_db),
 ):
     """Update employee details"""
     
     employee = db.query(models.Employee).filter(
-        models.Employee.id == employee_id
+        models.Employee.user_id == user_id
     ).first()
     
     if not employee:
