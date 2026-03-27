@@ -339,7 +339,7 @@ def create_employee(
     db_employee = models.Employee(**employee_data)
     db.add(db_employee)
     db.flush()  # Get employee ID
-    
+    user.is_employee_created = True  # Mark that employee record is created for this user
     # Create bank detail
     if employee_in.bank_detail:
         bank_detail_data = employee_in.bank_detail.model_dump()
@@ -752,92 +752,16 @@ def create_employees_bulk(
     
     created_employees = []
     errors = []
-    
-    for idx, employee_in in enumerate(employees_in):
+    for idx, emp_in in enumerate(employees_in):
         try:
-            # Check if employee code exists
-            existing = db.query(models.Employee).filter(
-                models.Employee.employee_code == employee_in.employee_code
-            ).first()
-            if existing:
-                errors.append({
-                    "index": idx,
-                    "employee_code": employee_in.employee_code,
-                    "error": "Employee code already exists"
-                })
-                continue
-            
-            # Check if user exists
-            user = db.query(User).filter(User.id == employee_in.user_id).first()
-            if not user:
-                errors.append({
-                    "index": idx,
-                    "employee_code": employee_in.employee_code,
-                    "error": "User not found"
-                })
-                continue
-            
-            # Create employee
-            employee_data = employee_in.model_dump(exclude={
-                'bank_detail', 'employee_personal_detail', 
-                'employee_document_detail', 'employee_profile'
-            })
-            db_employee = models.Employee(**employee_data)
-            db.add(db_employee)
-            db.flush()
-            
-            # Create related details
-            if employee_in.bank_detail:
-                db_bank = models.BankDetail(**employee_in.bank_detail.model_dump(), employee_id=db_employee.id)
-                db.add(db_bank)
-            
-            if employee_in.employee_personal_detail:
-                db_personal = models.EmployeePersonalDetail(
-                    **employee_in.employee_personal_detail.model_dump(), 
-                    employee_id=db_employee.id
-                )
-                db.add(db_personal)
-            
-            if employee_in.employee_document_detail:
-                db_doc = models.EmployeeDocumentDetail(
-                    **employee_in.employee_document_detail.model_dump(), 
-                    employee_id=db_employee.id
-                )
-                db.add(db_doc)
-            
-            if employee_in.employee_profile:
-                db_profile = models.EmployeeProfile(
-                    **employee_in.employee_profile.model_dump(), 
-                    employee_id=db_employee.id
-                )
-                db.add(db_profile)
-            
-            created_employees.append(db_employee)
-            
-        except Exception as e:
+            employee = create_employee(emp_in, db)
+            created_employees.append(employee)
+        except HTTPException as e:
             errors.append({
                 "index": idx,
-                "employee_code": employee_in.employee_code,
-                "error": str(e)
+                "phone_number": emp_in.phone_number,
+                "error": e.detail
             })
-    
-    db.commit()
-    
-    # Refresh all created employees
-    for employee in created_employees:
-        db.refresh(employee)
-    
-    if errors:
-        raise HTTPException(
-            status_code=status.HTTP_207_MULTI_STATUS,
-            detail={
-                "message": "Bulk operation completed with errors",
-                "created": len(created_employees),
-                "errors": errors
-            }
-        )
-    
-    return created_employees
 
 # ==================== Export Routes ====================
 @router.get("/export/employees")
@@ -889,3 +813,31 @@ def export_employees(
         )
     
     return export_data
+
+
+
+router_hr = APIRouter(prefix="/hr", tags=["HR Management"])
+
+
+@router_hr.get("/onboarding")
+def get_pending_onboarding_users(
+    db: Session = Depends(get_db)
+):
+    """Get users who have registered but employee record is not created yet"""
+    pending_users = db.query(User).filter(
+        and_(
+            User.is_employee_created == False,
+            User.employee_code != 'admin'  # Exclude admin user
+        )
+    ).all()
+    
+    return [
+        {
+            "user_id": user.id,
+            "phone_number": user.phone_number,
+            "full_name": user.full_name,
+            "email": user.email,
+            "employee_code": user.employee_code
+        }
+        for user in pending_users
+    ]

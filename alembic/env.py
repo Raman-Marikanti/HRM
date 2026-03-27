@@ -13,10 +13,20 @@ from app.modules.employee import models as emp_models  # noqa: F401
 
 config = context.config
 fileConfig(config.config_file_name)
-
+from app.modules.admin.models import User  # noqa: F401
+from app.modules.employee.models import Department, Designation, Employee, BankDetail, EmployeeDocumentDetail
+from app.modules.attendance.models import Attendance, AttendanceSetting
 # this is the metadata object the 'autogenerate' support uses
-target_metadata = Base.metadata
-
+target_metadata = [
+                    User.__table__.metadata,
+                    Department.__table__.metadata, 
+                    Designation.__table__.metadata, 
+                    Employee.__table__.metadata,
+                    BankDetail.__table__.metadata,
+                    EmployeeDocumentDetail.__table__.metadata,
+                    Attendance.__table__.metadata,
+                    AttendanceSetting.__table__.metadata
+                    ]
 
 def run_migrations_offline():
     """Run migrations in 'offline' mode."""

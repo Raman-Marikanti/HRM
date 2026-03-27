@@ -17,7 +17,7 @@ class AttendanceBase(BaseModel):
     remarks: Optional[str] = None
 
 class CheckInRequest(BaseModel):
-    employee_id: int
+    user_id: int
     check_in_ip: Optional[str] = Field(None, max_length=45)
     check_in_device: Optional[str] = Field(None, max_length=255)
     check_in_location: Optional[str] = Field(None, max_length=255)
@@ -25,7 +25,7 @@ class CheckInRequest(BaseModel):
     remarks: Optional[str] = None
 
 class CheckOutRequest(BaseModel):
-    employee_id: int
+    user_id: int
     check_out_ip: Optional[str] = Field(None, max_length=45)
     check_out_device: Optional[str] = Field(None, max_length=255)
     check_out_location: Optional[str] = Field(None, max_length=255)
@@ -33,7 +33,7 @@ class CheckOutRequest(BaseModel):
     remarks: Optional[str] = None
 
 class AttendanceCreate(AttendanceBase):
-    employee_id: int
+    user_id: int
     status: Optional[str] = "present"
 
 class AttendanceUpdate(BaseModel):
@@ -106,7 +106,7 @@ class DailyAttendanceStats(BaseModel):
     attendance_percentage: float
 
 class EmployeeAttendanceStats(BaseModel):
-    employee_id: int
+    user_id: int
     employee_name: str
     employee_code: str
     total_days: int
@@ -131,7 +131,7 @@ class AttendanceImportResponse(BaseModel):
 
 # Query Filters
 class AttendanceFilter(BaseModel):
-    employee_id: Optional[int] = None
+    user_id: Optional[int] = None
     start_date: Optional[datetime] = None
     end_date: Optional[datetime] = None
     status: Optional[str] = None

@@ -18,6 +18,3 @@ def get_db():
     finally:
         db.close()
 
-def init_models():
-	# Create tables (for development). In production use Alembic migrations.
-	Base.metadata.create_all(engine)

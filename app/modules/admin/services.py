@@ -208,13 +208,13 @@ def send_otp(phone_number: str, purpose: str = "login", expire_minutes: int = 5)
         print(f"📱 OTP for {phone_number}: {otp} (expires in {expire_minutes} minutes)")
         
         # Try to send via MSG91 if configured
-        # sms_sent = False 
-        # if settings.MSG91_AUTH_KEY and settings.MSG91_TEMPLATE_ID:
-            # sms_sent = send_otp_via_msg91(normalized_phone, otp, expire_minutes)
-            # if sms_sent:
-                # logger.info(f"SMS sent via MSG91 to {normalized_phone}")
-        # else:
-            # logger.warning("MSG91 not configured - OTP will not be sent via SMS")
+        sms_sent = False 
+        if settings.MSG91_AUTH_KEY and settings.MSG91_TEMPLATE_ID:
+            sms_sent = send_otp_via_msg91(normalized_phone, otp, expire_minutes)
+            if sms_sent:
+                logger.info(f"SMS sent via MSG91 to {normalized_phone}")
+        else:
+            logger.warning("MSG91 not configured - OTP will not be sent via SMS")
         # 
         # Store OTP for verification
         ttl = expire_minutes * 60

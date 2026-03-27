@@ -1,4 +1,6 @@
 # app/modules/attendance/routes.py
+from html import parser
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status, UploadFile, File
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, or_, func, desc
@@ -24,7 +26,7 @@ def check_in(
     """Employee check-in"""
     
     # Check if employee exists
-    employee = db.query(Employee).filter(Employee.id == check_in_data.employee_id).first()
+    employee = db.query(Employee).filter(Employee.user_id == check_in_data.user_id).first()
     if not employee:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -41,13 +43,14 @@ def check_in(
     # Get current date
     current_date = check_in_data.date or datetime.utcnow()
     today = current_date.replace(hour=0, minute=0, second=0, microsecond=0)
-    
+    employee_id = employee.id
     # Check if already checked in today
     existing_attendance = db.query(models.Attendance).filter(
         and_(
-            models.Attendance.employee_id == check_in_data.employee_id,
+            models.Attendance.employee_id == employee_id,
             models.Attendance.date >= today,
-            models.Attendance.date < today + timedelta(days=1)
+            models.Attendance.date < today + timedelta(days=1),
+            models.Attendance.is_checked_out == False
         )
     ).first()
     
@@ -60,7 +63,7 @@ def check_in(
     
     # Create attendance record
     attendance = models.Attendance(
-        employee_id=check_in_data.employee_id,
+        employee_id=employee_id,
         date=current_date,
         check_in_time=current_date,
         check_in_ip=check_in_data.check_in_ip,
@@ -75,8 +78,9 @@ def check_in(
         late_minutes = (datetime.combine(date.today(), check_in_time) - 
                        datetime.combine(date.today(), settings.office_start_time)).total_seconds() / 60
         if late_minutes > settings.late_threshold_minutes:
-            attendance.status = "late"
-    
+            attendance.working_status = models.WorkingStatus.LATE_LOGIN.value
+    # if check_in_time < settings.office_start_time - timedelta(minutes=15):
+    #     attendance.working_status = models.WorkingStatus.EARLY_LOGIN.value
     db.add(attendance)
     db.commit()
     db.refresh(attendance)
@@ -91,7 +95,7 @@ def check_out(
     """Employee check-out"""
     
     # Check if employee exists
-    employee = db.query(Employee).filter(Employee.id == check_out_data.employee_id).first()
+    employee = db.query(Employee).filter(Employee.user_id == check_out_data.user_id).first()
     if not employee:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -105,11 +109,10 @@ def check_out(
     # Get today's attendance record
     attendance = db.query(models.Attendance).filter(
         and_(
-            models.Attendance.employee_id == check_out_data.employee_id,
+            models.Attendance.employee_id == employee.id,
             models.Attendance.date >= today,
             models.Attendance.date < today + timedelta(days=1),
-            
-            
+            models.Attendance.check_out_time == None
         )
     ).first()
     
@@ -143,7 +146,11 @@ def check_out(
 
     if check_out and check_out.tzinfo is None:
         check_out = check_out.replace(tzinfo=timezone.utc)
-        
+
+    # if check_out < settings.office_end_time:
+    #     attendance.working_status = models.WorkingStatus.EARLY_LOGOUT.value
+    # if check_out > settings.office_end_time + timedelta(minutes=15):
+    #     attendance.working_status = models.WorkingStatus.LATE_LOGOUT.value
     if attendance.check_in_time:
         duration =check_out - check_in
         hours = duration.total_seconds() // 3600
@@ -153,7 +160,7 @@ def check_out(
         # Update status based on working hours
         settings = db.query(models.AttendanceSetting).first()
         if settings and hours < settings.half_day_threshold_hours:
-            attendance.status = "half-day"
+            attendance.status = models.AttendanceStatus.HALF_DAY.value
     
     db.commit()
     db.refresh(attendance)
@@ -161,22 +168,46 @@ def check_out(
     return attendance
 
 
-@router.get("/today/{employee_id}")
-def get_today_attendance(employee_id: int, db: Session = Depends(get_db)):
-    """Get today's first check-in, last check-out, and total working hours"""
 
-    # ✅ use timezone-aware
+@router.get("/today/{user_id}")
+def get_today_attendance(user_id: int, db: Session = Depends(get_db)):
+    """Get today's first check-in, last check-out, total working hours, break time, and attendance tag"""
+
+    # Start of today in UTC
     today = datetime.now(timezone.utc).replace(
         hour=0, minute=0, second=0, microsecond=0
     )
+    tomorrow = today + timedelta(days=1)
 
-    records = db.query(models.Attendance).filter(
-        and_(
-            models.Attendance.employee_id == employee_id,
-            models.Attendance.check_in_time >= today,
-            models.Attendance.check_in_time < today + timedelta(days=1)
+    # Get employee
+    employee = db.query(Employee).filter(Employee.user_id == user_id).first()
+    if not employee:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Employee not found"
         )
-    ).order_by(models.Attendance.check_in_time.asc()).all()
+
+    # Get settings
+    settings = db.query(models.AttendanceSetting).first()
+    if not settings:
+        settings = models.AttendanceSetting()
+        db.add(settings)
+        db.commit()
+        db.refresh(settings)
+
+    # Get today's attendance records
+    records = (
+        db.query(models.Attendance)
+        .filter(
+            and_(
+                models.Attendance.employee_id == employee.id,
+                models.Attendance.check_in_time >= today,
+                models.Attendance.check_in_time < tomorrow
+            )
+        )
+        .order_by(models.Attendance.check_in_time.asc())
+        .all()
+    )
 
     if not records:
         raise HTTPException(
@@ -184,53 +215,281 @@ def get_today_attendance(employee_id: int, db: Session = Depends(get_db)):
             detail="No attendance record found for today"
         )
 
-   
     first_check_in = records[0].check_in_time
 
-  
-    last_check_out = None
-    for r in reversed(records):
-        if r.check_out_time:
-            last_check_out = r.check_out_time
-            break
+    # Check if any session is still open
+    has_open_session = any(r.check_out_time is None for r in records)
 
+    # Last check-out only if all sessions are closed
+    if has_open_session:
+        last_check_out = None
+    else:
+        last_check_out = next(
+            (r.check_out_time for r in reversed(records) if r.check_out_time is not None),
+            None
+        )
+
+    # Single loop for total working time + break time
     total_seconds = 0
+    break_time_seconds = 0
+    previous_check_out = None
 
     for r in records:
-        if r.check_in_time and r.check_out_time:
+        check_in = r.check_in_time
+        check_out = r.check_out_time
 
-            check_in = r.check_in_time
-            check_out = r.check_out_time
+        # Normalize check_in
+        if check_in and check_in.tzinfo is None:
+            check_in = check_in.replace(tzinfo=timezone.utc)
 
-            # 🔥 normalize timezone (avoid your previous error)
-            if check_in.tzinfo is None:
-                check_in = check_in.replace(tzinfo=timezone.utc)
+        # Calculate break time from previous session
+        if previous_check_out and check_in:
+            gap = check_in - previous_check_out
+            if gap.total_seconds() > 0:
+                break_time_seconds += int(gap.total_seconds())
+
+        # Normalize check_out and calculate working time
+        if check_out:
             if check_out.tzinfo is None:
                 check_out = check_out.replace(tzinfo=timezone.utc)
 
-            diff = check_out - check_in
-            total_seconds += int(diff.total_seconds())
+            work_diff = check_out - check_in
+            if work_diff.total_seconds() > 0:
+                total_seconds += int(work_diff.total_seconds())
 
+            previous_check_out = check_out
+        else:
+            previous_check_out = None  # open session, no break can be calculated after this yet
+
+    # Format working time
     hours = total_seconds // 3600
     minutes = (total_seconds % 3600) // 60
     seconds = total_seconds % 60
-
     total_working_hours = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    total_working_hours_decimal = total_seconds / 3600
 
-   
+    # Format break time
+    break_hours = break_time_seconds // 3600
+    break_minutes = (break_time_seconds % 3600) // 60
+    break_seconds = break_time_seconds % 60
+    break_time = f"{break_hours:02d}:{break_minutes:02d}:{break_seconds:02d}"
+
+    # Normalize first_check_in
+    first_check_in_utc = first_check_in
+    if first_check_in_utc.tzinfo is None:
+        first_check_in_utc = first_check_in_utc.replace(tzinfo=timezone.utc)
+
+    # Build office start/end datetimes
+    office_start_dt = datetime.combine(
+        today.date(), settings.office_start_time
+    ).replace(tzinfo=timezone.utc)
+
+    office_end_dt = datetime.combine(
+        today.date(), settings.office_end_time
+    ).replace(tzinfo=timezone.utc)
+
+    # Conditions
+    late_cutoff = office_start_dt + timedelta(minutes=settings.late_threshold_minutes)
+    is_late_login = first_check_in_utc > late_cutoff
+
+    is_early_logout = False
+    if last_check_out is not None:
+        last_check_out_utc = last_check_out
+        if last_check_out_utc.tzinfo is None:
+            last_check_out_utc = last_check_out_utc.replace(tzinfo=timezone.utc)
+
+        is_early_logout = last_check_out_utc < office_end_dt
+
+    is_half_day = total_working_hours_decimal < settings.half_day_threshold_hours
+
+    # Priority-based single tag
+    if has_open_session:
+        tag = "Present (Open Session)"
+    elif is_half_day:
+        tag = "Half Day"
+    elif is_late_login:
+        tag = "Late Login"
+    elif is_early_logout:
+        tag = "Early Logout"
+    else:
+        tag = "Present"
+
     return {
-        "employee_id": employee_id,
+        "employee_id": employee.id,
+        "user_id": employee.user_id,
         "date": today.date(),
         "first_check_in": first_check_in,
         "last_check_out": last_check_out,
         "total_working_hours": total_working_hours,
-        "sessions_count": len(records)
+        "break_time": break_time,
+        "sessions_count": len(records),
+        "tags": tag
     }
+
+
+from datetime import datetime, timedelta
+
+def calculate_attendance_status(first_check_in, last_check_out, worked_minutes, settings):
+    statuses = []
+
+    # 1. No worked hours = absent
+    if worked_minutes == 0:
+        statuses.append("absent")
+        return "absent", statuses
+
+    # Use naive datetime for comparison (same as DB values)
+    office_start_dt = datetime.combine(
+        first_check_in.date(),
+        settings.office_start_time
+    )
+    office_end_dt = datetime.combine(
+        first_check_in.date(),
+        settings.office_end_time
+    )
+
+    # Late buffer
+    late_buffer_dt = office_start_dt + timedelta(minutes=settings.late_threshold_minutes)
+
+    # Company full working minutes
+    company_work_minutes = int(
+        (
+            datetime.combine(first_check_in.date(), settings.office_end_time)
+            - datetime.combine(first_check_in.date(), settings.office_start_time)
+        ).total_seconds() // 60
+    )
+
+    # 2. Present if completed full office hours
+    if worked_minutes >= company_work_minutes:
+        statuses.append("present")
+
+    # 3. Late login
+    if first_check_in and first_check_in > late_buffer_dt:
+        statuses.append("late-login")
+
+    # 4. Early logout
+    if last_check_out and last_check_out < office_end_dt:
+        statuses.append("early-logout")
+
+    # 5. Half day
+    if worked_minutes < (settings.half_day_threshold_hours * 60):
+        statuses.append("half-day")
+
+    # If no status but has worked hours
+    if not statuses:
+        statuses.append("present")
+
+    return ", ".join(statuses), statuses
+
+@router.get("/records/{user_id}")
+def get_attendance_records_for_user(
+    user_id: int,
+    start_date: Optional[datetime] = Query(None),
+    end_date: Optional[datetime] = Query(None),
+    db: Session = Depends(get_db)
+):
+    """Get attendance records for a user with optional date filters"""
+
+    # Check employee
+    employee = db.query(Employee).filter(Employee.user_id == user_id).first()
+    if not employee:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Employee not found"
+        )
+
+    # Get attendance settings
+    settings = db.query(models.AttendanceSetting).first()
+    if not settings:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Attendance settings not found"
+        )
+
+    query = db.query(models.Attendance).filter(
+        models.Attendance.employee_id == employee.id
+    )
+
+    if start_date:
+        query = query.filter(models.Attendance.date >= start_date)
+
+    if end_date:
+        query = query.filter(models.Attendance.date <= end_date)
+
+    records = query.order_by(
+        models.Attendance.date.asc(),
+        models.Attendance.check_in_time.asc()
+    ).all()
+
+    grouped_data = {}
+
+    for record in records:
+        record_date = record.date.date() if hasattr(record.date, "date") else record.date
+
+        if record_date not in grouped_data:
+            grouped_data[record_date] = {
+                "date": str(record_date),
+                "first_check_in": record.check_in_time,
+                "last_check_out": record.check_out_time,
+                "worked_minutes": 0
+            }
+
+        # Earliest check-in
+        if record.check_in_time:
+            if (
+                grouped_data[record_date]["first_check_in"] is None
+                or record.check_in_time < grouped_data[record_date]["first_check_in"]
+            ):
+                grouped_data[record_date]["first_check_in"] = record.check_in_time
+
+        # Latest check-out
+        if record.check_out_time:
+            if (
+                grouped_data[record_date]["last_check_out"] is None
+                or record.check_out_time > grouped_data[record_date]["last_check_out"]
+            ):
+                grouped_data[record_date]["last_check_out"] = record.check_out_time
+
+        # Sum worked minutes
+        if record.check_in_time and record.check_out_time:
+            diff = record.check_out_time - record.check_in_time
+            grouped_data[record_date]["worked_minutes"] += int(diff.total_seconds() // 60)
+
+    response = []
+
+    for _, data in grouped_data.items():
+        total_minutes = data["worked_minutes"]
+        hours = total_minutes // 60
+        minutes = total_minutes % 60
+
+        final_status, all_statuses = calculate_attendance_status(
+            first_check_in=data["first_check_in"],
+            last_check_out=data["last_check_out"],
+            worked_minutes=total_minutes,
+            settings=settings
+        )
+
+        response.append({
+            "date": data["date"],
+            "first_check_in": data["first_check_in"],
+            "last_check_out": data["last_check_out"],
+            "status": final_status,
+            "all_statuses": all_statuses,
+            "worked_hours": f"{hours:02d}:{minutes:02d}",
+            "worked_minutes": total_minutes
+        })
+
+    response.sort(key=lambda x: x["date"], reverse=True)
+
+    return {
+        "records": response
+    }
+
+
 
 # ==================== Attendance Records Routes ====================
 @router.get("/records", response_model=List[schemas.AttendanceDetailResponse])
 def get_attendance_records(
-    employee_id: Optional[int] = Query(None),
+    user_id: Optional[int] = Query(None),
     department_id: Optional[int] = Query(None),
     start_date: Optional[datetime] = Query(None),
     end_date: Optional[datetime] = Query(None),
@@ -242,10 +501,10 @@ def get_attendance_records(
     """Get attendance records with filters"""
     
     query = db.query(models.Attendance)
-    
+    employee = db.query(Employee).filter(Employee.user_id == user_id).first()
     # Apply filters
-    if employee_id:
-        query = query.filter(models.Attendance.employee_id == employee_id)
+    if user_id:
+        query = query.filter(models.Attendance.employee_id == employee.id)
     
     if department_id:
         query = query.join(Employee).filter(Employee.department_id == department_id)
@@ -445,9 +704,9 @@ def get_daily_statistics(
         "attendance_percentage": round(attendance_percentage, 2)
     }
 
-@router.get("/statistics/employee/{employee_id}")
+@router.get("/statistics/employee/{user_id}")
 def get_employee_statistics(
-    employee_id: int,
+    user_id: int,
     start_date: Optional[datetime] = Query(None),
     end_date: Optional[datetime] = Query(None),
     db: Session = Depends(get_db)
@@ -455,7 +714,7 @@ def get_employee_statistics(
     """Get attendance statistics for an employee"""
     
     # Check if employee exists
-    employee = db.query(Employee).filter(Employee.id == employee_id).first()
+    employee = db.query(Employee).filter(Employee.user_id == user_id).first()
     if not employee:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -472,7 +731,7 @@ def get_employee_statistics(
     # Get attendance records
     records = db.query(models.Attendance).filter(
         and_(
-            models.Attendance.employee_id == employee_id,
+            models.Attendance.employee_id == employee.id,
             models.Attendance.date >= start_date,
             models.Attendance.date <= end_date
         )
@@ -487,7 +746,7 @@ def get_employee_statistics(
     attendance_percentage = (present_days / total_days * 100) if total_days > 0 else 0
     
     return {
-        "employee_id": employee_id,
+        "employee_id": employee.id,
         "employee_name": employee.full_name,
         "employee_code": employee.employee_code,
         "start_date": start_date,
@@ -572,7 +831,6 @@ async def import_attendance_csv(
     import_record = models.AttendanceImport(
         file_name=file.filename,
         file_path=f"uploads/{file.filename}",
-        created_by=current_user.id,
         status="processing"
     )
     db.add(import_record)

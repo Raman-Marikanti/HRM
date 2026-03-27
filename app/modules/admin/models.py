@@ -40,6 +40,8 @@ class User(Base):
     # Phone verification
     is_phone_verified = Column(Boolean, default=False, nullable=False)
     phone_verified_at = Column(DateTime, nullable=True)
+
+    is_employee_created = Column(Boolean, nullable=False, default=False) # To track if employee record is created for this user
     
     # Security
     failed_otp_attempts = Column(Integer, default=0)

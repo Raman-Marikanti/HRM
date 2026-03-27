@@ -1,8 +1,23 @@
 # app/modules/attendance/models.py
+import enum
+
 from sqlalchemy import Column, Integer, DateTime, ForeignKey, String, Boolean, Time, Index, Text
 from sqlalchemy.orm import backref, relationship
 from datetime import datetime
 from app.core.database import Base
+
+class AttendanceStatus(str, enum.Enum):
+    PRESENT = "present"
+    ABSENT = "absent"
+    HALF_DAY = "half-day"
+    
+
+class WorkingStatus(str, enum.Enum):
+    LATE_LOGOUT = "late-logout"
+    LATE_LOGIN = "late-login"
+    EARLY_LOGOUT = "early-logout"
+    EARLY_LOGIN = "early-login"
+
 
 class Attendance(Base):
     __tablename__ = "attendance"
@@ -19,7 +34,8 @@ class Attendance(Base):
     check_in_location = Column(String(255), nullable=True)
     check_out_location = Column(String(255), nullable=True)
     working_hours = Column(String(10), nullable=True)  # Format: "HH:MM:SS"
-    status = Column(String(20), default="present", nullable=False)  # present, absent, half-day, late
+    status = Column(String(20), default=AttendanceStatus.PRESENT.value, nullable=False)  # present, absent, half-day, late
+    working_status = Column(String(20), default="", nullable=True)  # full-day, half-day
     remarks = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
