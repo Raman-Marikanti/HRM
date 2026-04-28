@@ -167,6 +167,32 @@ def check_out(
     
     return attendance
 
+@router.get("/weekly/{user_id}")
+def get_weekly_attendance(user_id: int, db: Session = Depends(get_db)):
+    """Get weekly attendance for a user"""
+    today = datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    week_start = today - timedelta(days=today.weekday())
+    week_end = week_start + timedelta(days=7)
+    
+    # Get attendance records for the week
+    attendance_records = db.query(models.AttendanceRecord).filter(
+        models.AttendanceRecord.employee_id == user_id,
+        models.AttendanceRecord.date >= week_start,
+        models.AttendanceRecord.date < week_end
+    ).all()
+    employee = db.query(Employee).filter(Employee.user_id == user_id).first()
+    if not employee:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Employee not found"
+        )
+    week_days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    data = []
+    for i in week_days:
+        i['Monday'] = []
+        
 
 
 @router.get("/today/{user_id}")
